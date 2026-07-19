@@ -1,0 +1,42 @@
+[build-system]
+requires = ["scikit-build-core", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "mpmt"
+version = "0.1.0"
+description = "Multiparty Private Membership Test — Python bindings"
+requires-python = ">=3.10"
+
+dependencies = [
+    "cloudpickle>=2.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+bench = ["pytest-benchmark"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "benchmarks"]
+python_files = ["test_*.py", "bm_*.py"]
+python_functions = ["test_*", "bm_*"]
+markers = [
+    "slow: large-scale tests (e.g. hadamard stress, opt-in via MPC_BENCH_LARGE)",
+]
+
+[tool.pytest-benchmark]
+# Warmup avoids page-fault noise on first iteration (critical for 2G vectors)
+benchmark_warmup = true
+
+[tool.scikit-build]
+cmake.source-dir = "."
+build-dir = "build"
+wheel.packages = ["src/mpmt"]
+cmake.build-type = "Release"
+cmake.args = [
+    "-GNinja",
+    "-DCMAKE_C_COMPILER=clang-15",
+    "-DCMAKE_CXX_COMPILER=clang++-15",
+    "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+    "-DCMAKE_VERBOSE_MAKEFILE=ON"
+]

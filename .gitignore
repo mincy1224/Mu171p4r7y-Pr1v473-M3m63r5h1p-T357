@@ -1,0 +1,13 @@
+build
+.vscode
+.cache
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.benchmarks
+*.o
+*.so
+*.a
+tmp
+examples
