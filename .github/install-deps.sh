@@ -10,12 +10,12 @@ echo "Building $PKG ..."
 git clone --depth 1 "$REPO" "/tmp/$PKG"
 cd "/tmp/$PKG"
 
-cmake . \
+cmake -B build \
   -DCMAKE_C_COMPILER=clang-15 \
   -DCMAKE_CXX_COMPILER=clang++-15 \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX=/usr/local
 
-make -j"$(nproc)"
-sudo make install
+cmake --build build -j"$(nproc)"
+sudo cmake --install build
 rm -rf "/tmp/$PKG"
