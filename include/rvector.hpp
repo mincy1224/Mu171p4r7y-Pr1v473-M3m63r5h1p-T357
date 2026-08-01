@@ -8,6 +8,7 @@
 #ifndef RVECTOR_HPP
 #define RVECTOR_HPP
 
+#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,40 @@
 
 namespace scucse::crypto::math
 {
+
+/// Minimal aligned allocator for std::vector — ensures cache-line and
+/// SIMD alignment required by streaming stores (_mm_stream_si128, etc.).
+template <typename T, size_t Alignment>
+struct AlignedAlloc
+{
+    using value_type = T;
+    AlignedAlloc() = default;
+    template <typename U>
+    AlignedAlloc(const AlignedAlloc<U, Alignment>&) noexcept {}
+    template <typename U>
+    struct rebind { using other = AlignedAlloc<U, Alignment>; };
+    [[nodiscard]] T* allocate(size_t n)
+    {
+        if (n == 0) return nullptr;
+        // C17 requires size to be a multiple of alignment
+        constexpr size_t mask = Alignment - 1;
+        size_t bytes = (n * sizeof(T) + mask) & ~mask;
+        void* p = std::aligned_alloc(Alignment, bytes);
+        if (!p) throw std::bad_alloc();
+        return static_cast<T*>(p);
+    }
+    void deallocate(T* p, size_t) noexcept { std::free(p); }
+};
+template <typename T, typename U, size_t A>
+bool operator==(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
+{
+    return true;
+}
+template <typename T, typename U, size_t A>
+bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
+{
+    return false;
+}
 
     // SIMD pack/unpack kernels — forward declarations
     /// Optimised pack/unpack for large vectors.
@@ -294,7 +329,11 @@ namespace scucse::crypto::math
         }
         size_t bit = i * 5;
         for (; i < n; ++i, bit += 5)
-            dst[i] = ((src[bit/8] >> (bit%8)) | (src[bit/8+1] << (8 - bit%8))) & M;
+        {
+            dst[i] = (src[bit/8] >> (bit%8)) & M;
+            if (bit%8 + 5 > 8)
+                dst[i] |= (src[bit/8+1] << (8 - bit%8)) & M;
+        }
     }
 
     // ——— ELL=6: 4 elements ↔ 3 bytes ———
@@ -336,7 +375,11 @@ namespace scucse::crypto::math
         }
         size_t bit = i * 6;
         for (; i < n; ++i, bit += 6)
-            dst[i] = ((src[bit/8] >> (bit%8)) | (src[bit/8+1] << (8 - bit%8))) & M;
+        {
+            dst[i] = (src[bit/8] >> (bit%8)) & M;
+            if (bit%8 + 6 > 8)
+                dst[i] |= (src[bit/8+1] << (8 - bit%8)) & M;
+        }
     }
 
     // ——— ELL=7: 8 elements ↔ 7 bytes ———
@@ -395,13 +438,21 @@ namespace scucse::crypto::math
         }
         size_t bit = i * 7;
         for (; i < n; ++i, bit += 7)
-            dst[i] = ((src[bit/8] >> (bit%8)) | (src[bit/8+1] << (8 - bit%8))) & M;
+        {
+            dst[i] = (src[bit/8] >> (bit%8)) & M;
+            if (bit%8 + 7 > 8)
+                dst[i] |= (src[bit/8+1] << (8 - bit%8)) & M;
+        }
     }
 
 
     /// @brief Pre-allocated packed-byte buffer — works for all ELL 1‥8.
+    /// The internal buffer is 16-byte aligned for SIMD streaming stores.
     struct RvectorPack
     {
+        static constexpr size_t PACK_ALIGN = 16;
+        using BufType = std::vector<uint8_t, AlignedAlloc<uint8_t, PACK_ALIGN>>;
+
         RvectorPack(uint64_t ell, size_t n) : ell_(ell), n_(n), buf_(_bytesFor(ell, n)) {}
 
         const uint8_t* data() const noexcept { return buf_.data(); }
@@ -414,13 +465,17 @@ namespace scucse::crypto::math
         template <uint64_t> friend class Rvector;
         static size_t _bytesFor(uint64_t ell, size_t n)
         {
+            if (n > SIZE_MAX / 8)  // guard multiplication overflow below
+                throw std::overflow_error("RvectorPack: n too large");
             if (ell == 1) return ((n + 63) / 64) * 8;
             if (ell == 8) return n;
+            if (n > SIZE_MAX / ell)
+                throw std::overflow_error("RvectorPack: n * ell would overflow");
             return (n * ell + 7) / 8;
         }
         uint64_t ell_;
         size_t n_;
-        std::vector<uint8_t> buf_;
+        BufType buf_;
     };
 
     // forward declarations
@@ -512,7 +567,8 @@ namespace scucse::crypto::math
     public:
         Rvector() = default;
 
-        /// @brief Construct a zero-initialised vector of @p n elements.
+        /// @brief Construct an uninitialised vector of @p n elements.
+        /// Use fill() to initialise all elements to a known value.
         explicit Rvector(size_t n) : n_(n)
         {
             allocData(wordsFor(n));
@@ -680,30 +736,34 @@ namespace scucse::crypto::math
         void save(const std::string& path, RvectorPack& auxBuf) const
         {
             _checkExt(path, ".mpmtrvp", "save");
-            auto f = fopen(path.c_str(), "wb");
+            auto f = std::unique_ptr<FILE, decltype(&fclose)>(
+                fopen(path.c_str(), "wb"), &fclose);
             if (!f) throw std::runtime_error("save: cannot open " + path);
-            fwrite(&FILE_MAGIC, sizeof(uint32_t), 1, f);
+            if (fwrite(&FILE_MAGIC, sizeof(uint32_t), 1, f.get()) != 1)
+                throw std::runtime_error("save: failed to write magic");
             uint64_t hdr[2] = {ELL, n_};
-            fwrite(hdr, sizeof(uint64_t), 2, f);
+            if (fwrite(hdr, sizeof(uint64_t), 2, f.get()) != 2)
+                throw std::runtime_error("save: failed to write header");
             packRvec(*this, auxBuf);
-            fwrite(auxBuf.data(), 1, auxBuf.size(), f);
-            fclose(f);
+            if (fwrite(auxBuf.data(), 1, auxBuf.size(), f.get()) != auxBuf.size())
+                throw std::runtime_error("save: failed to write payload");
         }
 
         void load(const std::string& path, RvectorPack& auxBuf)
         {
             _checkExt(path, ".mpmtrvp", "load");
-            auto f = fopen(path.c_str(), "rb");
+            auto f = std::unique_ptr<FILE, decltype(&fclose)>(
+                fopen(path.c_str(), "rb"), &fclose);
             if (!f) throw std::runtime_error("load: cannot open " + path);
 
             // read and validate magic
             uint32_t magic = 0;
-            if (fread(&magic, sizeof(uint32_t), 1, f) != 1 || magic != FILE_MAGIC)
+            if (fread(&magic, sizeof(uint32_t), 1, f.get()) != 1 || magic != FILE_MAGIC)
                 throw std::runtime_error("load: not a valid .mpmtrvp file (bad magic)");
 
             // read header
             uint64_t hdr[2];
-            if (fread(hdr, sizeof(uint64_t), 2, f) != 2)
+            if (fread(hdr, sizeof(uint64_t), 2, f.get()) != 2)
                 throw std::runtime_error("load: truncated header in " + path);
             if (hdr[0] != ELL)
                 throw std::runtime_error(
@@ -715,18 +775,18 @@ namespace scucse::crypto::math
                     + " this=" + std::to_string(n_));
 
             // verify payload size
-            long cur = ftell(f);
-            fseek(f, 0, SEEK_END);
-            long end = ftell(f);
-            fseek(f, cur, SEEK_SET);
+            long cur = ftell(f.get());
+            fseek(f.get(), 0, SEEK_END);
+            long end = ftell(f.get());
+            fseek(f.get(), cur, SEEK_SET);
             size_t payloadSize = static_cast<size_t>(end - cur);
             if (payloadSize != auxBuf.size())
                 throw std::runtime_error(
                     "load: corrupt file — expected " + std::to_string(auxBuf.size())
                     + " bytes payload, got " + std::to_string(payloadSize));
 
-            fread(auxBuf.data(), 1, auxBuf.size(), f);
-            fclose(f);
+            if (fread(auxBuf.data(), 1, auxBuf.size(), f.get()) != auxBuf.size())
+                throw std::runtime_error("load: truncated payload in " + path);
             unpackRvec(auxBuf, *this);
             if constexpr (ELL == 1) maskPartialLastWord();
         }
@@ -738,8 +798,13 @@ namespace scucse::crypto::math
     public:
 
         /// @brief Get the element at index @p i.
+        /// @throws std::out_of_range if @p i exceeds the vector size.
         uint8_t get(size_t i) const
         {
+            if (i >= n_)
+                throw std::out_of_range(
+                    "Rvector::get: index " + std::to_string(i)
+                    + " out of range [0, " + std::to_string(n_) + ")");
             if constexpr (ELL == 1)
             {
                 return (data_[i / 64] >> (i % 64)) & 1;
@@ -751,8 +816,13 @@ namespace scucse::crypto::math
         }
 
         /// @brief Set the element at index @p i to @p val.
+        /// @throws std::out_of_range if @p i exceeds the vector size.
         void set(size_t i, uint8_t val)
         {
+            if (i >= n_)
+                throw std::out_of_range(
+                    "Rvector::set: index " + std::to_string(i)
+                    + " out of range [0, " + std::to_string(n_) + ")");
             if constexpr (ELL == 1)
             {
                 if (val & 1)
@@ -833,6 +903,8 @@ namespace scucse::crypto::math
         }
 
         /// @name Element-wise arithmetic
+        /// @note The output parameter @p out must NOT alias @p a or @p b.
+        ///       Internal kernels use @c __restrict__ pointers for SIMD performance.
         /// @{
 
         /// @brief out[i] = (a[i] + b[i]) mod 2^ELL
