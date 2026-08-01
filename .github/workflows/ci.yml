@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  schedule:
+    - cron: '7 3 * * 1'   # every Monday 03:07 UTC
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    env:
+      CC: clang-15
+      CXX: clang++-15
+      EMP_INSTALL_PREFIX: /usr/local
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            clang-15 cmake ninja-build \
+            libsodium-dev nlohmann-json3-dev \
+            libssl-dev python3-pip
+
+      # ── emp-tool ─────────────────────────────────────────────
+      - name: Cache emp-tool
+        id: cache-emp-tool
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.EMP_INSTALL_PREFIX }}/lib/libemp-tool.*
+          key: emp-tool-${{ hashFiles('.github/install-deps.sh') }}
+
+      - name: Build emp-tool
+        if: steps.cache-emp-tool.outputs.cache-hit != 'true'
+        run: .github/install-deps.sh emp-tool
+
+      # ── emp-ot ───────────────────────────────────────────────
+      - name: Cache emp-ot
+        id: cache-emp-ot
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.EMP_INSTALL_PREFIX }}/lib/libemp-ot.*
+          key: emp-ot-${{ hashFiles('.github/install-deps.sh') }}
+
+      - name: Build emp-ot
+        if: steps.cache-emp-ot.outputs.cache-hit != 'true'
+        run: .github/install-deps.sh emp-ot
+
+      # ── emp-sh2pc ────────────────────────────────────────────
+      - name: Cache emp-sh2pc
+        id: cache-emp-sh2pc
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.EMP_INSTALL_PREFIX }}/lib/libemp-sh2pc.*
+          key: emp-sh2pc-${{ hashFiles('.github/install-deps.sh') }}
+
+      - name: Build emp-sh2pc
+        if: steps.cache-emp-sh2pc.outputs.cache-hit != 'true'
+        run: .github/install-deps.sh emp-sh2pc
+
+      # ── Python dependencies ──────────────────────────────────
+      - name: Install Python packages
+        run: |
+          pip install --upgrade pip
+          pip install nanobind>=2.13 scikit-build-core cloudpickle
+
+      # ── Build mpmt ───────────────────────────────────────────
+      - name: Build mpmt
+        run: pip install -e . -v
+
+      # ── Tests ────────────────────────────────────────────────
+      - name: Run all tests
+        run: python3 tests/run_all.py
