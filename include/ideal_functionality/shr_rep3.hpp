@@ -129,7 +129,7 @@ namespace scucse::crypto
                             } -> std::same_as<void>;
                         } &&
                         // ringConv<ELL_TO>: only valid when ELL == 1 (binary RSS → arithmetic RSS),
-                        // and ELL_TO must be in [2, 8].
+                        // and ELL_TO must be in [2, 6].
                         ((ELL != 1) ||
                             []<std::size_t... Is>(std::index_sequence<Is...>)
                             {
@@ -149,7 +149,7 @@ namespace scucse::crypto
                                         } -> std::same_as<void>;
                                     } && ...
                                 );
-                            }(std::make_index_sequence<7>{}));
+                            }(std::make_index_sequence<5>{}));
 } // namespace scucse::crypto
 
 #endif // !SHR_REP3_HPP

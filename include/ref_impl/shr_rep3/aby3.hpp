@@ -5,9 +5,13 @@
 #ifndef ABY3_HPP
 #define ABY3_HPP
 
+#include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <immintrin.h>
 #include <sodium.h>
 #include <emp-tool/emp-tool.h>
@@ -19,6 +23,10 @@
 namespace scucse::crypto
 {
 
+/// @brief 3-party replicated secret sharing (ABY3).
+/// @warning This class is NOT thread-safe. A single instance must not be
+///          shared across threads — all protocol operations (share, mul,
+///          hadamard, dot, ringConv, etc.) share CRNG state internally.
 template <ShrRep3Pid PID, uint64_t ELL, template <uint64_t> typename RVECTOR>
 class Aby3
 {
@@ -56,6 +64,38 @@ public:
 
         ccrhThis_ = emp::CCRH(keyThis);
         ccrhPrev_ = emp::CCRH(keyPrev);
+
+        // Start persistent I/O workers for parallel send+recv in _reshare_ring
+        sendWorker_ = std::thread(&Aby3::sendLoop, this);
+        recvWorker_ = std::thread(&Aby3::recvLoop, this);
+    }
+
+    ~Aby3()
+    {
+        shutdown();
+    }
+
+    /// Shut down the persistent I/O worker threads.
+    void shutdown()
+    {
+        if (shutdown_) return;
+
+        // Wake workers and tell them to exit
+        {
+            std::lock_guard lk(sendMtx_);
+            shutdown_ = true;
+            sendReady_ = true;
+        }
+        sendCv_.notify_one();
+
+        {
+            std::lock_guard lk(recvMtx_);
+            recvReady_ = true;
+        }
+        recvCv_.notify_one();
+
+        if (sendWorker_.joinable()) sendWorker_.join();
+        if (recvWorker_.joinable()) recvWorker_.join();
     }
 
     /// Flush both underlying IOChannels.
@@ -66,19 +106,44 @@ public:
     }
 
     /// Chunked ring reshare — send *sendBuf* to PREV, recv into *recvBuf*
-    /// from NEXT.  1 MiB chunks prevent TCP buffer deadlock when all 3
-    /// parties execute the same send→recv ring pattern simultaneously.
+    /// from NEXT.  64 KiB chunks, send and recv run in parallel via
+    /// persistent worker threads created at construction.
     void _reshare_ring(const void* sendBuf, void* recvBuf, size_t totalBytes)
     {
-        constexpr size_t CHUNK = 1 << 16; // 64 KiB — conservative for default TCP buffers
-        auto* snd = static_cast<const uint8_t*>(sendBuf);
-        auto* rcv = static_cast<uint8_t*>(recvBuf);
-        for (size_t off = 0; off < totalBytes; off += CHUNK)
+        // Set up work for both workers
         {
-            size_t n = std::min(CHUNK, totalBytes - off);
-            nioToPrev_->send_data(snd + off, n);
-            nioToPrev_->flush();
-            nioToNext_->recv_data(rcv + off, n);
+            std::lock_guard lk(sendMtx_);
+            sendBuf_ = static_cast<const uint8_t*>(sendBuf);
+            sendTotal_ = totalBytes;
+            sendReady_ = true;
+        }
+        sendCv_.notify_one();
+
+        {
+            std::lock_guard lk(recvMtx_);
+            recvBuf_ = static_cast<uint8_t*>(recvBuf);
+            recvTotal_ = totalBytes;
+            recvReady_ = true;
+        }
+        recvCv_.notify_one();
+
+        // Wait for both to finish, then check errors
+        {
+            std::unique_lock lk(sendMtx_);
+            sendCv_.wait(lk, [this] { return sendDone_; });
+            sendDone_ = false;
+        }
+        {
+            std::unique_lock lk(recvMtx_);
+            recvCv_.wait(lk, [this] { return recvDone_; });
+            recvDone_ = false;
+        }
+
+        // Re-throw any worker error
+        {
+            std::lock_guard lk(errMtx_);
+            if (sendErr_) std::rethrow_exception(sendErr_);
+            if (recvErr_) std::rethrow_exception(recvErr_);
         }
     }
 
@@ -104,8 +169,6 @@ public:
         {
             throw std::invalid_argument("share: vec must not alias oVec.thisShare");
         }
-
-        const size_t n = vec.size();
 
         // 3-out-of-3 share: oVec.thisShare = vec + crng
         crng<ELL>(oVec.thisShare);
@@ -356,8 +419,6 @@ public:
             throw std::invalid_argument("hadamard: oVec must not alias iVec1 or iVec2");
         }
 
-        const size_t n = iVec1.thisShare.size();
-
         // oVec.thisShare = i1.s1 ⊙ i2.s1
         RVECTOR<ELL>::hadamard(iVec1.thisShare, iVec2.thisShare, oVec.thisShare);
 
@@ -396,7 +457,7 @@ public:
     }
 
     template <uint64_t ELL_TO>
-        requires(ELL == 1 && ELL_TO >= 2 && ELL_TO <= 8)
+        requires(ELL == 1 && ELL_TO >= 2 && ELL_TO <= 6)
     ShareScalar ringConv(const ShareScalar num)
     {
         const uint8_t b0 = num.thisShare; // 0 or 1
@@ -511,7 +572,7 @@ public:
     }
 
     template <uint64_t ELL_TO>
-        requires(ELL == 1 && ELL_TO >= 2 && ELL_TO <= 8)
+        requires(ELL == 1 && ELL_TO >= 2 && ELL_TO <= 6)
     void ringConv(const ShareVector<ELL>& iVec, ShareVector<ELL_TO>& oVec)
     {
         const size_t n = iVec.thisShare.size();
@@ -678,7 +739,7 @@ public:
             {
                 alignas(16) emp::block ids[4], rawThis[4], rawPrev[4];
                 uint64_t base[2];
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(base), cRngId_);
+                std::memcpy(base, &cRngId_, sizeof(cRngId_));
                 for (int k = 0; k < 4; ++k)
                 {
                     uint64_t lo = base[0] + k;
@@ -694,7 +755,7 @@ public:
                     ++base[1];
                 }
 
-                cRngId_ = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base));
+                std::memcpy(&cRngId_, base, sizeof(cRngId_));
 
                 ccrhThis_.H<4>(rawThis, ids);
                 ccrhPrev_.H<4>(rawPrev, ids);
@@ -738,7 +799,7 @@ public:
             {
                 alignas(16) emp::block ids[4], rawThis[4], rawPrev[4];
                 uint64_t base[2];
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(base), cRngId_);
+                std::memcpy(base, &cRngId_, sizeof(cRngId_));
                 for (int k = 0; k < 4; ++k)
                 {
                     uint64_t lo = base[0] + k;
@@ -753,7 +814,7 @@ public:
                 {
                     ++base[1];
                 }
-                cRngId_ = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base));
+                std::memcpy(&cRngId_, base, sizeof(cRngId_));
 
                 ccrhThis_.H<4>(rawThis, ids);
                 ccrhPrev_.H<4>(rawPrev, ids);
@@ -795,13 +856,13 @@ private:
         crngBitCache_ = _mm_xor_si128(rawThis, rawPrev);
 
         uint64_t counter[2];
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(counter), cRngId_);
+        std::memcpy(counter, &cRngId_, sizeof(cRngId_));
         if (++counter[0] == 0)
         {
             ++counter[1];
         }
 
-        cRngId_ = _mm_loadu_si128(reinterpret_cast<const __m128i*>(counter));
+        std::memcpy(&cRngId_, counter, sizeof(cRngId_));
     }
 
     emp::IOChannel* nioToPrev_, *nioToNext_;
@@ -811,6 +872,104 @@ private:
     __m128i crngCache_;
     __m128i crngBitCache_;
     uint8_t crngPtr_;
+
+    // ── Persistent I/O worker threads for _reshare_ring ──
+    std::thread sendWorker_, recvWorker_;
+    bool shutdown_ = false;
+
+    // Send worker state
+    std::mutex sendMtx_;
+    std::condition_variable sendCv_;
+    const uint8_t* sendBuf_ = nullptr;
+    size_t sendTotal_ = 0;
+    bool sendReady_ = false;
+    bool sendDone_ = false;
+
+    // Recv worker state
+    std::mutex recvMtx_;
+    std::condition_variable recvCv_;
+    uint8_t* recvBuf_ = nullptr;
+    size_t recvTotal_ = 0;
+    bool recvReady_ = false;
+    bool recvDone_ = false;
+
+    // Error propagation
+    std::mutex errMtx_;
+    std::exception_ptr sendErr_;
+    std::exception_ptr recvErr_;
+
+    void sendLoop()
+    {
+        constexpr size_t CHUNK = 1 << 16;
+        while (true)
+        {
+            {
+                std::unique_lock lk(sendMtx_);
+                sendCv_.wait(lk, [this] { return sendReady_; });
+                if (shutdown_) return;
+            }
+
+            try
+            {
+                auto* snd = sendBuf_;
+                size_t total = sendTotal_;
+                for (size_t off = 0; off < total; off += CHUNK)
+                {
+                    size_t n = std::min(CHUNK, total - off);
+                    nioToPrev_->send_data(snd + off, n);
+                    nioToPrev_->flush();
+                }
+            }
+            catch (...)
+            {
+                std::lock_guard lk(errMtx_);
+                if (!sendErr_) sendErr_ = std::current_exception();
+            }
+
+            {
+                std::lock_guard lk(sendMtx_);
+                sendReady_ = false;
+                sendDone_ = true;
+            }
+            sendCv_.notify_one();
+        }
+    }
+
+    void recvLoop()
+    {
+        constexpr size_t CHUNK = 1 << 16;
+        while (true)
+        {
+            {
+                std::unique_lock lk(recvMtx_);
+                recvCv_.wait(lk, [this] { return recvReady_; });
+                if (shutdown_) return;
+            }
+
+            try
+            {
+                auto* rcv = recvBuf_;
+                size_t total = recvTotal_;
+                for (size_t off = 0; off < total; off += CHUNK)
+                {
+                    size_t n = std::min(CHUNK, total - off);
+                    nioToNext_->recv_data(rcv + off, n);
+                }
+            }
+            catch (...)
+            {
+                std::lock_guard lk(errMtx_);
+                if (!recvErr_) recvErr_ = std::current_exception();
+            }
+
+            {
+                std::lock_guard lk(recvMtx_);
+                recvReady_ = false;
+                recvDone_ = true;
+            }
+            recvCv_.notify_one();
+        }
+    }
 };
 
 } // namespace scucse::crypto

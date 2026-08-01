@@ -29,6 +29,7 @@ concept ShrAdd2Cnstr =
         uint32_t s2,
         uint32_t mv,
         const std::vector<uint8_t>& sv,
+        std::vector<uint8_t>& nsv,       // non-const for recv_data
         const uint8_t key16[16]
     )
     {
@@ -44,7 +45,7 @@ concept ShrAdd2Cnstr =
         { scheme.send(s1) } -> std::same_as<void>;
         { scheme.recv() } -> std::same_as<uint32_t>;
         { scheme.send_data(sv.data(), sv.size()) } -> std::same_as<void>;
-        { scheme.recv_data(sv.data(), sv.size()) } -> std::same_as<void>;
+        { scheme.recv_data(nsv.data(), nsv.size()) } -> std::same_as<void>;
     };
 } // namespace scucse::crypto
 

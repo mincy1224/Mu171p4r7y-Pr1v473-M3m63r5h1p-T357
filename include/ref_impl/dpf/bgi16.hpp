@@ -7,7 +7,9 @@
 
 #include <bit>
 #include <cstdint>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <sodium/core.h>
 #include <sodium/randombytes.h>
 #include <stdexcept>
@@ -103,9 +105,9 @@ namespace scucse::crypto
         /// Hex string → 16 raw bytes (used by KeyType deserialization).
         static void hexStringToBytes(const std::string& hex, uint8_t* out)
         {
-            if (hex.length() < 32)
+            if (hex.length() != 32)
             {
-                throw std::invalid_argument("hex string must be >= 32 chars");
+                throw std::invalid_argument("hex string must be exactly 32 chars");
             }
             for (size_t i = 0; i < 16; ++i)
             {
@@ -142,6 +144,7 @@ namespace scucse::crypto
         static void fullEval(const KeyType& key, RVECTOR& fdresBuf)
             requires(PARTY != DpfPid::DEALER)
         {
+            static_assert(CORES >= 1, "CORES must be >= 1");
 
             emp::CCRH ccrhL(_mm_loadu_si128(reinterpret_cast<const __m128i*>(key.keyL)));
             emp::CCRH ccrhR(_mm_loadu_si128(reinterpret_cast<const __m128i*>(key.keyR)));
@@ -149,7 +152,7 @@ namespace scucse::crypto
             constexpr uint64_t VEC_LEN = 1ULL << ELL_IN;
             if (fdresBuf.size() != VEC_LEN)
             {
-                throw std::logic_error("fdresBuf.size() must equal (1 << ELL_IN).");
+                throw std::invalid_argument("fdresBuf.size() must equal (1 << ELL_IN).");
             }
 
             constexpr uint64_t LOCAL_BFS_D = (ELL_IN < 8) ? ELL_IN : 8;
@@ -297,32 +300,44 @@ namespace scucse::crypto
             std::vector<std::thread> threads;
             threads.reserve(CORES);
 
-            for (uint32_t i = 0; i < CORES; ++i)
+            std::exception_ptr threadError;
+            std::mutex errorMutex;
+
+            try
             {
-                size_t startTask = i * tasksPerThread;
-                size_t endTask = std::min(startTask + tasksPerThread, totalTasks);
-
-                if (startTask >= totalTasks)
+                for (uint32_t i = 0; i < CORES; ++i)
                 {
-                    break;
-                }
+                    size_t startTask = i * tasksPerThread;
+                    size_t endTask = std::min(startTask + tasksPerThread, totalTasks);
 
-                threads.emplace_back([&evalThread, startTask, endTask]()
+                    if (startTask >= totalTasks) break;
+
+                    threads.emplace_back([&evalThread, startTask, endTask,
+                                          &threadError, &errorMutex]()
                     {
-                        evalThread(startTask, endTask);
+                        try { evalThread(startTask, endTask); }
+                        catch (...)
+                        {
+                            std::lock_guard lock(errorMutex);
+                            if (!threadError)
+                                threadError = std::current_exception();
+                        }
                     });
+                }
+            }
+            catch (...)
+            {
+                for (auto& t : threads)
+                    if (t.joinable()) t.join();
+                throw;
             }
 
             for (auto& t : threads)
-            {
-                if (t.joinable())
-                {
-                    t.join();
-                }
-            }
-        }
+                if (t.joinable()) t.join();
 
-        /// Offline range evaluation — computes only leaves in the specified range.
+            if (threadError)
+                std::rethrow_exception(threadError);
+        }
         /// Supports circular intervals: when ed &lt bg the range wraps around:
         ///   [bg, VEC_LEN) ∪ [0, ed]  (output is linearised with bg at offset 0).
         /// When bg ≤ ed the range is the closed interval [bg, ed].
@@ -332,6 +347,7 @@ namespace scucse::crypto
                               uint64_t bg, uint64_t ed)
             requires(PARTY != DpfPid::DEALER)
         {
+            static_assert(CORES >= 1, "CORES must be >= 1");
             constexpr uint64_t VEC_LEN = 1ULL << ELL_IN;
 
             // ——— bounds validation ———
@@ -347,7 +363,7 @@ namespace scucse::crypto
                 ? (VEC_LEN - bg) + ed + 1
                 : (ed - bg + 1);
             if (fdresBuf.size() != rangeLen)
-                throw std::logic_error("rangeEval: fdresBuf.size() must equal range length");
+                throw std::invalid_argument("rangeEval: fdresBuf.size() must equal range length");
 
             emp::CCRH ccrhL(_mm_loadu_si128(reinterpret_cast<const __m128i*>(key.keyL)));
             emp::CCRH ccrhR(_mm_loadu_si128(reinterpret_cast<const __m128i*>(key.keyR)));
@@ -542,23 +558,49 @@ namespace scucse::crypto
             std::vector<std::thread> threads;
             threads.reserve(CORES);
 
-            for (uint32_t i = 0; i < CORES; ++i)
+            std::exception_ptr threadError;
+            std::mutex errorMutex;
+
+            try
             {
-                size_t startTask = i * tasksPerThread;
-                size_t endTask = std::min(startTask + tasksPerThread, totalTasks);
+                for (uint32_t i = 0; i < CORES; ++i)
+                {
+                    size_t startTask = i * tasksPerThread;
+                    size_t endTask = std::min(startTask + tasksPerThread, totalTasks);
 
-                if (startTask >= totalTasks) break;
+                    if (startTask >= totalTasks) break;
 
-                threads.emplace_back([&evalThread, startTask, endTask]()
-                    { evalThread(startTask, endTask); });
+                    threads.emplace_back([&evalThread, startTask, endTask,
+                                          &threadError, &errorMutex]()
+                    {
+                        try { evalThread(startTask, endTask); }
+                        catch (...)
+                        {
+                            std::lock_guard lock(errorMutex);
+                            if (!threadError)
+                                threadError = std::current_exception();
+                        }
+                    });
+                }
+            }
+            catch (...)
+            {
+                for (auto& t : threads)
+                    if (t.joinable()) t.join();
+                throw;
             }
 
             for (auto& t : threads)
-            {
                 if (t.joinable()) t.join();
-            }
+
+            if (threadError)
+                std::rethrow_exception(threadError);
         }
 
+        /// Receive a DPF key from the network.
+        /// @warning Allocates from network-supplied length without bounds check.
+        /// Callers in untrusted environments must validate the peer or add
+        /// an application-layer size limit.
         KeyType recvKey()
         {
             uint64_t keyStrLen = 0;
@@ -617,6 +659,8 @@ namespace scucse::crypto
         /// Offline key generation — no network needed.
         static std::pair<KeyType, KeyType> gen(uint32_t alpha, uint8_t beta)
         {
+            if (sodium_init() < 0)
+                throw std::runtime_error("libsodium init failed");
             constexpr uint32_t DOMAIN_SIZE = 1ULL << ELL_IN;
             if (alpha >= DOMAIN_SIZE)
                 throw std::invalid_argument("gen: alpha out of range");
@@ -720,12 +764,32 @@ namespace scucse::crypto
         }
 
         /// Receive evaluation results from both Evaluators and add (mod 2^ELL).
+        /// Uses parallel threads to prevent deadlock when one evaluator
+        /// finishes before the other (sequential recv would block).
         void reveal(RVECTOR& out)
         {
             RVECTOR e0(out.size()), e1(out.size());
             const size_t sz = out.bytesSize();
-            nioToE0_->recv_data(e0.data(), sz);
-            nioToE1_->recv_data(e1.data(), sz);
+
+            std::exception_ptr err;
+            std::mutex errMutex;
+
+            auto recv_one = [&](emp::IOChannel* nio, uint8_t* dst)
+            {
+                try { nio->recv_data(dst, sz); }
+                catch (...)
+                {
+                    std::lock_guard lock(errMutex);
+                    if (!err) err = std::current_exception();
+                }
+            };
+
+            std::thread t0(recv_one, nioToE0_, e0.data());
+            std::thread t1(recv_one, nioToE1_, e1.data());
+            t0.join(); t1.join();
+
+            if (err) std::rethrow_exception(err);
+
             RVECTOR::add(e0, e1, out);
         }
 

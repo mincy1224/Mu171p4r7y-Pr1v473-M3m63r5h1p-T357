@@ -39,6 +39,8 @@ namespace scucse::crypto
         /// Takes a non-owning raw pointer; the caller owns the IOChannel lifetime.
         explicit Emp2(emp::IOChannel* io) : io_(io)
         {
+            if (sodium_init() < 0)
+                throw std::runtime_error("libsodium init failed");
             if constexpr (a())
             {
                 emp::block seed;
@@ -118,6 +120,8 @@ namespace scucse::crypto
         }
 
         /// Receive an XOR share.  Reads [uint64_t len][data].
+        /// @warning Allocates from network-supplied length without bounds check.
+        /// Callers in untrusted environments must add an application-layer limit.
         std::vector<uint8_t> recvBytes()
         {
             uint64_t len = 0;
@@ -156,6 +160,9 @@ namespace scucse::crypto
         /// @return ring-addition share of the ELL-bit hash output
         uint32_t hash(const uint8_t* myPt, size_t ptLen, const uint8_t* myKey)
         {
+            if (ptLen > 16)
+                throw std::invalid_argument(
+                    "hash: preimage must be <= 16 bytes, got " + std::to_string(ptLen));
             constexpr size_t N = 128;
             bool pt[N] = {}, ky[N] = {};
             bool zero[N] = {};
@@ -197,6 +204,8 @@ namespace scucse::crypto
 
         uint32_t mod(uint32_t my_a, uint32_t mv)
         {
+            if (mv == 0)
+                throw std::invalid_argument("mod: mv must not be zero");
             if (mv >= (1ULL << ELL))
                 throw std::invalid_argument("mod: mv must be < 2^ELL");
             auto a_a = sess_->template input<U>(emp::ALICE, a() ? my_a : 0);
