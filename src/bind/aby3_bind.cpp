@@ -49,11 +49,16 @@ template <ShrRep3Pid PID, uint64_t ELL> struct Rss3T
     using ShareVecType = ShrRep3ShareVec<ELL, bind::RVECTOR>;
     using ShareScalar = ShrRep3ShareScalar;
 
+    // shared_ptr keeps channels alive while protocol object exists
+    std::shared_ptr<emp::IOChannel> srv_, cli_;
+    std::unique_ptr<Aby3Type> aby3_;
+
     Rss3T() = default;
 
-    /// Construct with pre-built IOChannels (non-owning raw pointers).
-    Rss3T(emp::IOChannel* srv, emp::IOChannel* cli)
-        : aby3_(std::make_unique<Aby3Type>(srv, cli))
+    /// Construct with pre-built IOChannels (shared ownership).
+    Rss3T(std::shared_ptr<emp::IOChannel> srv, std::shared_ptr<emp::IOChannel> cli)
+        : srv_(std::move(srv)), cli_(std::move(cli)),
+          aby3_(std::make_unique<Aby3Type>(srv_.get(), cli_.get()))
     {
     }
 
@@ -274,12 +279,8 @@ template <ShrRep3Pid PID, uint64_t ELL> struct Rss3T
                 return aby3_->template ringConv<5>(ss);
             case 6:
                 return aby3_->template ringConv<6>(ss);
-            case 7:
-                return aby3_->template ringConv<7>(ss);
-            case 8:
-                return aby3_->template ringConv<8>(ss);
             default:
-                throw std::invalid_argument("ell_to must be in [2, 8]");
+                throw std::invalid_argument("ell_to must be in [2, 6]");
         }
     }
 
@@ -318,25 +319,11 @@ template <ShrRep3Pid PID, uint64_t ELL> struct Rss3T
                 aby3_->template ringConv<6>(sv, out);
                 break;
             }
-            case 7:
-            {
-                auto& out = nb::cast<ShrRep3ShareVec<7, bind::RVECTOR>&>(sv_out);
-                aby3_->template ringConv<7>(sv, out);
-                break;
-            }
-            case 8:
-            {
-                auto& out = nb::cast<ShrRep3ShareVec<8, bind::RVECTOR>&>(sv_out);
-                aby3_->template ringConv<8>(sv, out);
-                break;
-            }
             default:
-                throw std::invalid_argument("ell_to must be in [2, 8]");
+                throw std::invalid_argument("ell_to must be in [2, 6]");
         }
     }
 
-private:
-    std::unique_ptr<Aby3Type> aby3_;
 };
 
 // ———  bind helpers  ———
@@ -382,11 +369,11 @@ template <ShrRep3Pid PID, uint64_t ELL> static void bind_rss3_instance(nb::modul
         "__init__",
         [](T* self, nb::object srv_channel, nb::object cli_channel)
         {
-            auto srv_ptr = reinterpret_cast<emp::IOChannel*>(
+            auto srv = bind::netio_acquire(
                 nb::cast<uintptr_t>(srv_channel.attr("acquire")()));
-            auto cli_ptr = reinterpret_cast<emp::IOChannel*>(
+            auto cli = bind::netio_acquire(
                 nb::cast<uintptr_t>(cli_channel.attr("acquire")()));
-            new (self) T(srv_ptr, cli_ptr);
+            new (self) T(std::move(srv), std::move(cli));
         },
         "srv_channel"_a,
         "cli_channel"_a,
@@ -427,35 +414,24 @@ template <ShrRep3Pid PID, uint64_t ELL> static void bind_rss3_instance(nb::modul
     cls.def(
         "send_data",
         [](T& self, int to, nb::object data) {
-            PyObject* py_buf = data.ptr();
-            char* ptr = nullptr;
-            Py_ssize_t len = 0;
-            if (PyBytes_Check(py_buf)) {
-                ptr = PyBytes_AsString(py_buf);
-                len = PyBytes_Size(py_buf);
-            } else if (PyByteArray_Check(py_buf)) {
-                ptr = PyByteArray_AsString(py_buf);
-                len = PyByteArray_Size(py_buf);
-            } else {
-                throw std::invalid_argument("send_data: data must be bytes or bytearray");
+            auto [ptr, len] = bind::_getByteBuffer(data);
+            {
+                nb::gil_scoped_release release;
+                self.send_bytes(to, reinterpret_cast<const uint8_t*>(ptr), len);
             }
-            self.send_bytes(to, reinterpret_cast<const uint8_t*>(ptr), len);
         },
-        nb::call_guard<nb::gil_scoped_release>(),
         "to_pid"_a, "data"_a, "Send raw bytes (no length prefix) to party 'to_pid'"
     );
     cls.def("recv_data", &T::recv, "from_pid"_a, "Receive a scalar (uint8_t) from party 'from_pid'");
     cls.def(
         "recv_data",
         [](T& self, int from, nb::object buf) {
-            PyObject* py_buf = buf.ptr();
-            if (!PyByteArray_Check(py_buf))
-                throw std::invalid_argument("recv_data: buf must be a bytearray");
-            char* ptr = PyByteArray_AsString(py_buf);
-            Py_ssize_t len = PyByteArray_Size(py_buf);
-            self.recv_bytes(from, reinterpret_cast<uint8_t*>(ptr), len);
+            auto [ptr, len] = bind::_getWritableByteBuffer(buf);
+            {
+                nb::gil_scoped_release release;
+                self.recv_bytes(from, reinterpret_cast<uint8_t*>(ptr), len);
+            }
         },
-        nb::call_guard<nb::gil_scoped_release>(),
         "from_pid"_a, "buf"_a, "Receive raw bytes (no length prefix) from party 'from_pid' into pre-allocated buf"
     );
 
@@ -545,6 +521,7 @@ template <ShrRep3Pid PID, uint64_t ELL> static void bind_rss3_instance(nb::modul
         cls.def(
             "ring_conv",
             &T::ring_conv_scalar,
+            nb::call_guard<nb::gil_scoped_release>(),
             "ss"_a,
             "ell_to"_a,
             "Binary→arithmetic ring conversion (scalar)"
@@ -552,9 +529,8 @@ template <ShrRep3Pid PID, uint64_t ELL> static void bind_rss3_instance(nb::modul
         cls.def(
             "ring_conv_vec",
             &T::ring_conv_vec,
-            nb::call_guard<nb::gil_scoped_release>(),
             "sv"_a,
-            "sv_out"_a,
+            "sv_out"_a.noconvert(),
             "ell_to"_a,
             "Binary→arithmetic ring conversion (vector)"
         );
@@ -603,7 +579,9 @@ void bind_shr_rss3(nb::module_& m)
         {
             if (ell < bind::RSS3_ELL_MIN || ell > bind::RSS3_ELL_MAX)
             {
-                throw std::invalid_argument("ell out of range [1, 8]");
+                throw std::invalid_argument(
+    "ell out of range [" + std::to_string(bind::RSS3_ELL_MIN)
+    + ", " + std::to_string(bind::RSS3_ELL_MAX) + "]");
             }
             if (party < 0 || party > 2)
             {
@@ -623,7 +601,9 @@ void bind_shr_rss3(nb::module_& m)
         {
             if (ell < bind::RSS3_ELL_MIN || ell > bind::RSS3_ELL_MAX)
             {
-                throw std::invalid_argument("ell out of range [1, 8]");
+                throw std::invalid_argument(
+    "ell out of range [" + std::to_string(bind::RSS3_ELL_MIN)
+    + ", " + std::to_string(bind::RSS3_ELL_MAX) + "]");
             }
             return sv_types[ell];
         },

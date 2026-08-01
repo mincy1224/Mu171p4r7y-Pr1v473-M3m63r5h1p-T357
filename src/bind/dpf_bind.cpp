@@ -41,8 +41,14 @@ template <uint64_t ELL_IN, uint64_t ELL_OUT> struct DpfDealerT
     DpfDealerT() = default;
 
     /// Construct with pre-built IOChannels (non-owning raw pointers).
-    DpfDealerT(emp::IOChannel* nio0, emp::IOChannel* nio1)
-        : dealer_(std::make_unique<DealerType>(nio0, nio1))
+    // Channel handles must outlive the dealer; shared_ptr ensures this.
+    std::shared_ptr<emp::IOChannel> nio0_, nio1_;
+    std::unique_ptr<DealerType> dealer_;
+
+    DpfDealerT(std::shared_ptr<emp::IOChannel> nio0,
+               std::shared_ptr<emp::IOChannel> nio1)
+        : nio0_(std::move(nio0)), nio1_(std::move(nio1)),
+          dealer_(std::make_unique<DealerType>(nio0_.get(), nio1_.get()))
     {
     }
 
@@ -67,9 +73,6 @@ template <uint64_t ELL_IN, uint64_t ELL_OUT> struct DpfDealerT
     {
         dealer_->reveal(out);
     }
-
-private:
-    std::unique_ptr<DealerType> dealer_;
 };
 
 template <uint64_t EI, uint64_t EO> static void bind_dpf_dealer(nb::module_& m)
@@ -82,11 +85,11 @@ template <uint64_t EI, uint64_t EO> static void bind_dpf_dealer(nb::module_& m)
         .def(
             "__init__",
             [](DpfDealerT<EI, EO>* self, nb::object eval0_channel, nb::object eval1_channel) {
-                auto* nio0 = reinterpret_cast<emp::IOChannel*>(
+                auto nio0 = bind::netio_acquire(
                     nb::cast<uintptr_t>(eval0_channel.attr("acquire")()));
-                auto* nio1 = reinterpret_cast<emp::IOChannel*>(
+                auto nio1 = bind::netio_acquire(
                     nb::cast<uintptr_t>(eval1_channel.attr("acquire")()));
-                new (self) DpfDealerT<EI, EO>(nio0, nio1);
+                new (self) DpfDealerT<EI, EO>(std::move(nio0), std::move(nio1));
             },
             "eval0_channel"_a, "eval1_channel"_a,
             "Construct a DPF Dealer from persistent channels.\n"
@@ -115,11 +118,14 @@ template <uint64_t ELL_IN, uint64_t ELL_OUT, int PARTY> struct DpfEvaluatorT
     static constexpr uint64_t ell_out = ELL_OUT;
     static constexpr int party = PARTY;
 
+    std::shared_ptr<emp::IOChannel> nio_;
+    std::unique_ptr<EvalType> eval_;
+
     DpfEvaluatorT() = default;
 
-    /// Construct with a pre-built IOChannel (non-owning raw pointer).
-    DpfEvaluatorT(emp::IOChannel* nio)
-        : eval_(std::make_unique<EvalType>(nio))
+    /// Construct with a pre-built IOChannel (shared ownership).
+    DpfEvaluatorT(std::shared_ptr<emp::IOChannel> nio)
+        : nio_(std::move(nio)), eval_(std::make_unique<EvalType>(nio_.get()))
     {
     }
 
@@ -150,8 +156,6 @@ template <uint64_t ELL_IN, uint64_t ELL_OUT, int PARTY> struct DpfEvaluatorT
     {
         eval_->reveal(buf);
     }
-
-private:
     static void do_eval(const KeyType& key, bind::RVECTOR<ELL_OUT>& buf, int cores)
     {
         switch (cores)
@@ -162,7 +166,10 @@ private:
             case 8:  EvalType::template fullEval<8>(key, buf);  break;
             case 16: EvalType::template fullEval<16>(key, buf); break;
             case 32: EvalType::template fullEval<32>(key, buf); break;
-            default: EvalType::template fullEval<1>(key, buf);  break;
+            default:
+                throw std::invalid_argument(
+                    "eval: cores must be one of {1,2,4,8,16,32}, got "
+                    + std::to_string(cores));
         }
     }
 
@@ -177,11 +184,12 @@ private:
             case 8:  EvalType::template rangeEval<8>(key, buf, bg, ed);  break;
             case 16: EvalType::template rangeEval<16>(key, buf, bg, ed); break;
             case 32: EvalType::template rangeEval<32>(key, buf, bg, ed); break;
-            default: EvalType::template rangeEval<1>(key, buf, bg, ed);  break;
+            default:
+                throw std::invalid_argument(
+                    "eval_range: cores must be one of {1,2,4,8,16,32}, got "
+                    + std::to_string(cores));
         }
     }
-
-    std::unique_ptr<EvalType> eval_;
 };
 
 template <uint64_t EI, uint64_t EO, int P> static void bind_dpf_evaluator(nb::module_& m)
@@ -194,9 +202,9 @@ template <uint64_t EI, uint64_t EO, int P> static void bind_dpf_evaluator(nb::mo
         .def(
             "__init__",
             [](DpfEvaluatorT<EI, EO, P>* self, nb::object dealer_channel) {
-                auto* nio = reinterpret_cast<emp::IOChannel*>(
+                auto nio = bind::netio_acquire(
                     nb::cast<uintptr_t>(dealer_channel.attr("acquire")()));
-                new (self) DpfEvaluatorT<EI, EO, P>(nio);
+                new (self) DpfEvaluatorT<EI, EO, P>(std::move(nio));
             },
             "dealer_channel"_a,
             "Construct a DPF Evaluator from a persistent channel.\n"
@@ -254,7 +262,12 @@ void bind_dpf(nb::module_& m)
             if (ei < bind::DPF_ELL_IN_MIN || ei > bind::DPF_ELL_IN_MAX ||
                 eo < bind::DPF_ELL_OUT_MIN || eo > bind::DPF_ELL_OUT_MAX)
             {
-                throw std::invalid_argument("ell_in / ell_out out of range");
+                throw std::invalid_argument(
+                    "ell_in / ell_out out of range ["
+                    + std::to_string(bind::DPF_ELL_IN_MIN) + ", " + std::to_string(bind::DPF_ELL_IN_MAX)
+                    + "] / ["
+                    + std::to_string(bind::DPF_ELL_OUT_MIN) + ", " + std::to_string(bind::DPF_ELL_OUT_MAX)
+                    + "]");
             }
             return dealer_types[ei][eo];
         },
@@ -270,7 +283,12 @@ void bind_dpf(nb::module_& m)
             if (ei < bind::DPF_ELL_IN_MIN || ei > bind::DPF_ELL_IN_MAX ||
                 eo < bind::DPF_ELL_OUT_MIN || eo > bind::DPF_ELL_OUT_MAX)
             {
-                throw std::invalid_argument("ell_in / ell_out out of range");
+                throw std::invalid_argument(
+                    "ell_in / ell_out out of range ["
+                    + std::to_string(bind::DPF_ELL_IN_MIN) + ", " + std::to_string(bind::DPF_ELL_IN_MAX)
+                    + "] / ["
+                    + std::to_string(bind::DPF_ELL_OUT_MIN) + ", " + std::to_string(bind::DPF_ELL_OUT_MAX)
+                    + "]");
             }
             if (party != 0 && party != 1)
             {

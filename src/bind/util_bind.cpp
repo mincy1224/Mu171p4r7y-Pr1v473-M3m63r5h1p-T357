@@ -2,7 +2,13 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <unordered_map>
+
 #include <sodium/randombytes.h>
 
 #include "common.hpp"
@@ -11,6 +17,64 @@
 namespace nb = nanobind;
 using namespace scucse::crypto;
 using bind::_toBytes;
+using bind::_getByteBuffer;
+
+// ———  NetIO shared_ptr registry  ————————————————————————————————————————
+//  NetIO instances are managed via std::shared_ptr so that protocol objects
+//  (DpfDealerT, DpfEvaluatorT, Rss3T, Add2T, RingTransport) can share a
+//  single IOChannel safely.  Python holds an opaque uintptr_t handle; C++
+//  wrappers call netio_acquire() to obtain a shared_ptr copy.
+namespace {
+    std::mutex                      g_registry_mutex;
+    std::unordered_map<uintptr_t, std::shared_ptr<emp::NetIO>> g_registry;
+    std::atomic<uintptr_t>          g_next_handle{1};
+}
+
+namespace scucse::crypto::bind {
+
+std::shared_ptr<emp::IOChannel> netio_acquire(uintptr_t handle)
+{
+    std::lock_guard lock(g_registry_mutex);
+    auto it = g_registry.find(handle);
+    if (it == g_registry.end())
+        throw std::runtime_error(
+            "netio_acquire: handle " + std::to_string(handle) + " no longer valid");
+    return it->second;  // copies shared_ptr, increments ref count
+}
+
+void netio_release(uintptr_t handle)
+{
+    std::lock_guard lock(g_registry_mutex);
+    g_registry.erase(handle);
+    // NetIO is only deleted when the last shared_ptr copy is destroyed.
+}
+
+uintptr_t netio_register(std::shared_ptr<emp::NetIO> sp)
+{
+    uintptr_t h = g_next_handle.fetch_add(1);
+    std::lock_guard lock(g_registry_mutex);
+    g_registry[h] = std::move(sp);
+    return h;
+}
+
+} // namespace scucse::crypto::bind
+
+namespace {
+
+    /// Look up a NetIO raw pointer from its handle (throws if invalid).
+    /// The pointee stays alive because the registry holds a shared_ptr.
+    /// @warning Caller must not use the pointer after releasing the registry entry.
+    inline emp::NetIO* _lookup(uintptr_t handle)
+    {
+        std::lock_guard lock(g_registry_mutex);
+        auto it = g_registry.find(handle);
+        if (it == g_registry.end())
+            throw std::runtime_error(
+                "NetIO handle " + std::to_string(handle) + " is no longer valid");
+        return it->second.get();
+    }
+
+} // anonymous namespace
 
 // ———  module entry  ———
 
@@ -99,108 +163,115 @@ void bind_util(nb::module_& m)
 
     // ——— NetIO helpers ———
     //
-    //  NetIO objects are stored as opaque uintptr_t values in Python
-    //  because NetIO is not registered as a nanobind type.  The helpers
-    //  cast to/from raw pointers.  Channel() constructs the NetIO and
-    //  Channel.__del__() destroys it via _netio_delete.
+    //  NetIO instances are managed via std::shared_ptr behind an opaque
+    //  uintptr_t handle.  Python Channel objects hold the handle; C++
+    //  protocol wrappers call netio_acquire(handle) to share ownership.
 
     m.def(
         "NetIO_connect",
         [](const char* host, int port) -> uintptr_t {
-            auto* p = new emp::NetIO(host, port, /*quiet=*/true);
-            return reinterpret_cast<uintptr_t>(p);
+            auto sp = std::make_shared<emp::NetIO>(host, port, /*quiet=*/true);
+            return bind::netio_register(std::move(sp));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         "host"_a, "port"_a,
-        "Create a NetIO client connected to *host:port*.  Retries until the server is ready."
+        "Create a NetIO client connected to *host:port*.  "
+        "Returns an opaque handle for lifecycle management."
     );
 
     m.def(
         "NetIO_listen",
         [](int port) -> uintptr_t {
-            auto* p = new emp::NetIO(nullptr, port, /*quiet=*/true);
-            return reinterpret_cast<uintptr_t>(p);
+            auto sp = std::make_shared<emp::NetIO>(nullptr, port, /*quiet=*/true);
+            return bind::netio_register(std::move(sp));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         "port"_a,
-        "Create a NetIO server listening on *port*.  Blocks until a client connects."
+        "Create a NetIO server listening on *port*.  "
+        "Returns an opaque handle for lifecycle management."
     );
 
     m.def(
-        "_netio_delete",
-        [](uintptr_t ptr) {
-            delete reinterpret_cast<emp::NetIO*>(ptr);
+        "_netio_delete",  // kept for backwards compat — now just releases
+        [](uintptr_t handle) {
+            bind::netio_release(handle);
         },
-        "ptr"_a,
-        "Delete a NetIO instance.  Called from Channel.__del__."
+        "handle"_a,
+        "Release the NetIO handle.  Actual deletion occurs when all "
+        "protocol objects sharing this NetIO are also destroyed."
+    );
+
+    m.def(
+        "_netio_release",
+        [](uintptr_t handle) {
+            bind::netio_release(handle);
+        },
+        "handle"_a,
+        "Release the NetIO handle (alias for _netio_delete)."
     );
 
     m.def(
         "_netio_flush",
-        [](uintptr_t ptr) {
-            reinterpret_cast<emp::NetIO*>(ptr)->flush();
+        [](uintptr_t handle) {
+            _lookup(handle)->flush();
         },
         nb::call_guard<nb::gil_scoped_release>(),
-        "ptr"_a,
+        "handle"_a,
         "Flush the NetIO send buffer."
     );
 
     m.def(
         "_netio_send",
-        [](uintptr_t ptr, nb::object data) {
-            auto* p = reinterpret_cast<emp::NetIO*>(ptr);
-            PyObject* py_buf = data.ptr();
-            char* buf = nullptr;
-            Py_ssize_t len = 0;
-            if (PyBytes_Check(py_buf)) {
-                buf = PyBytes_AsString(py_buf);
-                len = PyBytes_Size(py_buf);
-            } else if (PyByteArray_Check(py_buf)) {
-                buf = PyByteArray_AsString(py_buf);
-                len = PyByteArray_Size(py_buf);
-            } else {
-                throw std::invalid_argument("_netio_send: data must be bytes or bytearray");
+        [](uintptr_t handle, nb::object data) {
+            // Extract C-string from Python object BEFORE releasing the GIL
+            // (nb::object destructor needs the GIL; manually scope the release).
+            auto [buf, len] = _getByteBuffer(data);
+            emp::NetIO* p = _lookup(handle);
+            {
+                nb::gil_scoped_release release;
+                p->send_data(buf, static_cast<size_t>(len));
+                p->flush();
             }
-            p->send_data(buf, len);
-            p->flush();
         },
-        nb::call_guard<nb::gil_scoped_release>(),
-        "ptr"_a, "data"_a,
+        "handle"_a, "data"_a,
         "Send raw bytes over the NetIO (with flush)."
     );
 
     m.def(
         "_netio_recv",
-        [](uintptr_t ptr, nb::object buf) {
-            auto* p = reinterpret_cast<emp::NetIO*>(ptr);
+        [](uintptr_t handle, nb::object buf) {
+            // Extract bytearray buffer BEFORE releasing the GIL.
             PyObject* py_buf = buf.ptr();
             if (!PyByteArray_Check(py_buf))
                 throw std::invalid_argument("_netio_recv: buf must be a bytearray");
             char* data = PyByteArray_AsString(py_buf);
             Py_ssize_t len = PyByteArray_Size(py_buf);
-            p->recv_data(data, len);
+            emp::NetIO* p = _lookup(handle);
+            {
+                nb::gil_scoped_release release;
+                p->recv_data(data, static_cast<size_t>(len));
+            }
         },
-        nb::call_guard<nb::gil_scoped_release>(),
-        "ptr"_a, "buf"_a,
+        "handle"_a, "buf"_a,
         "Receive raw bytes from the NetIO into a pre-allocated bytearray."
     );
 
     m.def(
         "_netio_clear_counters",
-        [](uintptr_t ptr) {
-            auto* p = reinterpret_cast<emp::NetIO*>(ptr);
-            p->send_counter = 0;
-            p->recv_counter = 0;
+        [](uintptr_t handle) {
+            auto sp = _lookup(handle);
+            sp->send_counter = 0;
+            sp->recv_counter = 0;
         },
-        "ptr"_a,
+        "handle"_a,
         "Reset send/recv byte counters to zero."
     );
 
     m.def(
         "NetIO_from_socket",
         [](int sock_fd) -> uintptr_t {
-            auto* p = new emp::NetIO(sock_fd, /*quiet=*/true);
-            return reinterpret_cast<uintptr_t>(p);
+            auto sp = std::make_shared<emp::NetIO>(sock_fd, /*quiet=*/true);
+            return bind::netio_register(std::move(sp));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         "sock_fd"_a,
@@ -210,12 +281,11 @@ void bind_util(nb::module_& m)
 
     m.def(
         "_netio_as_iochannel",
-        [](uintptr_t ptr) -> uintptr_t {
-            auto* netio = reinterpret_cast<emp::NetIO*>(ptr);
-            return reinterpret_cast<uintptr_t>(static_cast<emp::IOChannel*>(netio));
+        [](uintptr_t handle) -> uintptr_t {
+            return handle;  // handle is now the universal identifier
         },
-        "ptr"_a,
-        "Return the IOChannel* pointer as an integer, for passing to protocol constructors."
+        "handle"_a,
+        "Return the IOChannel handle (identity for protocol construction)."
     );
 
     // ——— local AES-DM hash ———

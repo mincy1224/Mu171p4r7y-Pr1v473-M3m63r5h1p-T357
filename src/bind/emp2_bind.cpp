@@ -40,11 +40,14 @@ template <uint64_t ELL, ShrAdd2Pid PARTY> struct Add2T
     using Emp2Type = bind::SHR_ADD2<PARTY, ELL>;
     static_assert(ShrAdd2Cnstr<PARTY, ELL, Emp2>);
 
+    std::shared_ptr<emp::IOChannel> io_;
+    std::unique_ptr<Emp2Type> emp2_;
+
     Add2T() = default;
 
-    /// Construct with a pre-built IOChannel (non-owning raw pointer).
-    explicit Add2T(emp::IOChannel* io)
-        : emp2_(std::make_unique<Emp2Type>(io))
+    /// Construct with a pre-built IOChannel (shared ownership).
+    explicit Add2T(std::shared_ptr<emp::IOChannel> io)
+        : io_(std::move(io)), emp2_(std::make_unique<Emp2Type>(io_.get()))
     {
     }
 
@@ -54,7 +57,12 @@ template <uint64_t ELL, ShrAdd2Pid PARTY> struct Add2T
 
     uint32_t share(uint32_t value)        { return emp2_->share(value); }
     uint32_t recvShare()                  { return emp2_->recvShare(); }
-    void     send_scalar(uint32_t val)    { emp2_->send(val); }
+    void send_scalar(uint32_t val) {
+        if (ELL < 32 && val >= (1ULL << ELL))
+            throw std::invalid_argument(
+                "send_scalar: val out of range for Z_{2^" + std::to_string(ELL) + "}");
+        emp2_->send(val);
+    }
     uint32_t recv_scalar()               { return emp2_->recv(); }
     void     send_bytes(const uint8_t* data, size_t len) { emp2_->send_data(data, len); }
     void     recv_bytes_(uint8_t* data, size_t len)      { emp2_->recv_data(data, len); }
@@ -88,8 +96,6 @@ template <uint64_t ELL, ShrAdd2Pid PARTY> struct Add2T
         return emp2_->equalityTest(my_a, my_b);
     }
 
-private:
-    std::unique_ptr<Emp2Type> emp2_;
 };
 
 // ———  lookup table  ———
@@ -111,9 +117,9 @@ template <uint64_t ELL, ShrAdd2Pid PARTY> static void bind_add2_instance(nb::mod
         .def(
             "__init__",
             [](T* self, nb::object peer_channel) {
-                auto* io = reinterpret_cast<emp::IOChannel*>(
+                auto io = bind::netio_acquire(
                     nb::cast<uintptr_t>(peer_channel.attr("acquire")()));
-                new (self) T(io);
+                new (self) T(std::move(io));
             },
             "peer_channel"_a,
             "Construct an additive-share party from a persistent channel.\n"
@@ -239,7 +245,9 @@ void bind_shr_add2(nb::module_& m)
         [](uint64_t ell, int party) -> nb::object
         {
             if (ell < bind::ADD2_ELL_MIN || ell > bind::ADD2_ELL_MAX)
-                throw std::invalid_argument("ell out of range [1, 31]");
+                throw std::invalid_argument(
+                    "ell out of range [" + std::to_string(bind::ADD2_ELL_MIN)
+                    + ", " + std::to_string(bind::ADD2_ELL_MAX) + "]");
             if (party != 0 && party != 1)
                 throw std::invalid_argument("party must be 0 or 1");
             return add2_types[ell][party];

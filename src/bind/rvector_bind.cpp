@@ -115,14 +115,13 @@ template <uint64_t ELL> static void bind_rvector(nb::module_& m, const char* nam
                 Py_buffer buf;
                 if (PyObject_GetBuffer(indices.ptr(), &buf, PyBUF_SIMPLE) != 0)
                     throw nb::python_error();
+                // RAII guard — released even if batchSet throws
+                auto guard = [](Py_buffer* b) { PyBuffer_Release(b); };
+                std::unique_ptr<Py_buffer, decltype(guard)> _(&buf, guard);
                 if (buf.itemsize != sizeof(uint64_t))
-                {
-                    PyBuffer_Release(&buf);
                     throw std::invalid_argument("batch_set: indices must be uint64_t array");
-                }
                 size_t n = buf.len / sizeof(uint64_t);
                 v.batchSet(static_cast<const uint64_t*>(buf.buf), n, val);
-                PyBuffer_Release(&buf);
             },
             "indices"_a, "val"_a,
             "Set v[indices[i]] = val for all i.  indices must be a uint64_t buffer (e.g. array('Q'))."
@@ -133,19 +132,14 @@ template <uint64_t ELL> static void bind_rvector(nb::module_& m, const char* nam
                 Py_buffer idxBuf;
                 if (PyObject_GetBuffer(indices.ptr(), &idxBuf, PyBUF_SIMPLE) != 0)
                     throw nb::python_error();
+                auto guard = [](Py_buffer* b) { PyBuffer_Release(b); };
+                std::unique_ptr<Py_buffer, decltype(guard)> _(&idxBuf, guard);
                 if (idxBuf.itemsize != sizeof(uint64_t))
-                {
-                    PyBuffer_Release(&idxBuf);
                     throw std::invalid_argument("batch_get: indices must be uint64_t array");
-                }
                 size_t n = idxBuf.len / sizeof(uint64_t);
                 if (out.size() < n)
-                {
-                    PyBuffer_Release(&idxBuf);
                     throw std::invalid_argument("batch_get: out.size() must be >= n");
-                }
                 v.batchGet(static_cast<const uint64_t*>(idxBuf.buf), n, out);
-                PyBuffer_Release(&idxBuf);
             },
             "indices"_a, "out"_a,
             "Write v[indices[i]] → out[i] for all i.  indices must be a uint64_t buffer."
@@ -246,8 +240,8 @@ template <uint64_t ELL> static void bind_rvector(nb::module_& m, const char* nam
 template <uint64_t ELL> struct RingVectorTransport
 {
     static_assert(ELL >= 1 && ELL <= 8, "ELL 1-8 for vector transport");
-    emp::IOChannel* io_;
-    RingVectorTransport(emp::IOChannel* io) : io_(io) {}
+    std::shared_ptr<emp::IOChannel> io_;
+    RingVectorTransport(std::shared_ptr<emp::IOChannel> io) : io_(std::move(io)) {}
 
     void send_vector(const math::Rvector<ELL>& vec, math::RvectorPack& auxBuf)
     {
@@ -263,9 +257,9 @@ template <uint64_t ELL> struct RingVectorTransport
 
 template <uint64_t ELL> struct RingScalarTransport
 {
-    static_assert(ELL >= 1 && ELL <= 64, "ELL 1-64 for scalar transport");
-    emp::IOChannel* io_;
-    RingScalarTransport(emp::IOChannel* io) : io_(io) {}
+    static_assert(ELL >= 1 && ELL <= 63, "ELL 1-63 for scalar transport");
+    std::shared_ptr<emp::IOChannel> io_;
+    RingScalarTransport(std::shared_ptr<emp::IOChannel> io) : io_(std::move(io)) {}
     static constexpr size_t BYTES = (ELL + 7) / 8;
 
     void send_scalar(uint64_t val)
@@ -305,9 +299,9 @@ template <uint64_t ELL> static void bind_ring_transport(nb::module_& m, const ch
         nb::class_<T>(m, name)
             .def("__init__",
                  [](T* self, nb::object channel) {
-                     auto* io = reinterpret_cast<emp::IOChannel*>(
+                     auto io = bind::netio_acquire(
                          nb::cast<uintptr_t>(channel.attr("acquire")()));
-                     new (self) T(io);
+                     new (self) T(std::move(io));
                  },
                  "channel"_a, "RingTransport(ell)(channel) — vector send/recv.")
             .def_prop_ro("ell", [](const T&) { return ELL; })
@@ -322,9 +316,9 @@ template <uint64_t ELL> static void bind_ring_transport(nb::module_& m, const ch
         nb::class_<T>(m, name)
             .def("__init__",
                  [](T* self, nb::object channel) {
-                     auto* io = reinterpret_cast<emp::IOChannel*>(
+                     auto io = bind::netio_acquire(
                          nb::cast<uintptr_t>(channel.attr("acquire")()));
-                     new (self) T(io);
+                     new (self) T(std::move(io));
                  },
                  "channel"_a, "RingTransport(ell)(channel) — scalar send/recv.")
             .def_prop_ro("ell", [](const T&) { return ELL; })
@@ -391,7 +385,9 @@ NB_MODULE(_mpmt, m)
         {
             if (ell < bind::RVECTOR_ELL_MIN || ell > bind::RVECTOR_ELL_MAX)
             {
-                throw std::invalid_argument("ell out of range");
+                throw std::invalid_argument(
+                    "ell out of range [" + std::to_string(bind::RVECTOR_ELL_MIN)
+                    + ", " + std::to_string(bind::RVECTOR_ELL_MAX) + "]");
             }
             return rv_types[ell];
         },
