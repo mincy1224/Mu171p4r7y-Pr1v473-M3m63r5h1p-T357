@@ -1,4 +1,4 @@
-# MPMT — Multiparty Private Membership Test[![status](https://img.shields.io/badge/status-WIP-orange)]()
+# MPMT — Multiparty Private Membership Test [![status](https://img.shields.io/badge/status-WIP-orange)]()
 
 A research prototype implementing MPMT(semi-honest) with C++20 and Python (nanobind 2.13).
 Enables private membership testing while keeping both query elements and
