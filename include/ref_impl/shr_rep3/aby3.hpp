@@ -5,6 +5,7 @@
 #ifndef ABY3_HPP
 #define ABY3_HPP
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
@@ -875,7 +876,7 @@ private:
 
     // ── Persistent I/O worker threads for _reshare_ring ──
     std::thread sendWorker_, recvWorker_;
-    bool shutdown_ = false;
+    std::atomic<bool> shutdown_{false};
 
     // Send worker state
     std::mutex sendMtx_;
