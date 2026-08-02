@@ -38,7 +38,7 @@ def recon2(r, ell):
 ELLS_ABY3 = [1, 6] if args.sm else list(range(1, 7))
 ELLS_EMP2 = [2, 31] if args.sm else list(range(2, 32))
 ELLS_RVEC = [1, 8] if args.sm else list(range(1, 9))
-DPF_EI     = [13, 31] if args.sm else list(range(13, 32))
+DPF_EI     = [13, 20] if args.sm else list(range(13, 32))
 DPF_EO     = [2, 6] if args.sm else list(range(2, 7))
 DPF_CORES  = [1] if args.sm else [1, 4, 8, 16]
 # Boundary sizes for packing corner cases
