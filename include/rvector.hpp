@@ -594,6 +594,7 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         explicit Rvector(size_t n) : n_(n)
         {
             allocData(wordsFor(n));
+            if constexpr (ELL == 1) maskPartialLastWord();
         }
 
         /// @brief Fill all elements with @p val (default 0).
@@ -1331,8 +1332,10 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         if (auxBuf.ell() != ELL || auxBuf.nElements() != src.size())
             throw std::invalid_argument("packRvec: auxBuf ell/n mismatch");
         const uint8_t* s = src.bytes();
-        if constexpr (ELL == 1 || ELL == 8)
-            std::memcpy(auxBuf.data(), s, src.bytesSize());
+        if constexpr (ELL == 1 || ELL == 8) {
+            if (src.bytesSize() > 0)
+                std::memcpy(auxBuf.data(), s, src.bytesSize());
+        }
         else if constexpr (ELL == 2)      _pack2(s, src.size(), auxBuf.data());
         else if constexpr (ELL == 3)      _pack3(s, src.size(), auxBuf.data());
         else if constexpr (ELL == 4)      _pack4(s, src.size(), auxBuf.data());
@@ -1346,8 +1349,10 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
     {
         if (auxBuf.ell() != ELL || auxBuf.nElements() != dst.size())
             throw std::invalid_argument("unpackRvec: auxBuf ell/n mismatch");
-        if constexpr (ELL == 1 || ELL == 8)
-            std::memcpy(dst.data(), auxBuf.data(), std::min(auxBuf.size(), dst.bytesSize()));
+        if constexpr (ELL == 1 || ELL == 8) {
+            if (dst.bytesSize() > 0)
+                std::memcpy(dst.data(), auxBuf.data(), std::min(auxBuf.size(), dst.bytesSize()));
+        }
         else if constexpr (ELL == 2)      _unpack2(auxBuf.data(), dst.size(), reinterpret_cast<uint8_t*>(dst.data()));
         else if constexpr (ELL == 3)      _unpack3(auxBuf.data(), dst.size(), reinterpret_cast<uint8_t*>(dst.data()));
         else if constexpr (ELL == 4)      _unpack4(auxBuf.data(), dst.size(), reinterpret_cast<uint8_t*>(dst.data()));
