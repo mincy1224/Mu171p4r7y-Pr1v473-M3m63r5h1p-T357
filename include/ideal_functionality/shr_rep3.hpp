@@ -31,8 +31,8 @@ namespace scucse::crypto
     /// @brief Scalar replicated share: (thisShare, nxtShare).
     struct ShrRep3ShareScalar
     {
-        uint8_t thisShare;
-        uint8_t nxtShare;
+        uint8_t thisShare{0};
+        uint8_t nxtShare{0};
     };
 
     /// @brief Vector replicated share over Z_{2^ELL}.
