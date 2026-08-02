@@ -455,7 +455,11 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         static constexpr size_t PACK_ALIGN = 16;
         using BufType = std::vector<uint8_t, AlignedAlloc<uint8_t, PACK_ALIGN>>;
 
-        RvectorPack(uint64_t ell, size_t n) : ell_(ell), n_(n), buf_(_bytesFor(ell, n)) {}
+        RvectorPack(uint64_t ell, size_t n) : ell_(ell), n_(n), buf_(_bytesFor(ell, n))
+        {
+            if (ell < 1 || ell > 8)
+                throw std::invalid_argument("RvectorPack: ell must be in [1, 8]");
+        }
 
         const uint8_t* data() const noexcept { return buf_.data(); }
         uint8_t*       data()       noexcept { return buf_.data(); }
@@ -467,7 +471,9 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         template <uint64_t> friend class Rvector;
         static size_t _bytesFor(uint64_t ell, size_t n)
         {
-            if (n > SIZE_MAX / 8)  // guard multiplication overflow below
+            if (ell < 1 || ell > 8)
+                throw std::invalid_argument("RvectorPack: ell must be in [1, 8]");
+            if (n > SIZE_MAX / 8)
                 throw std::overflow_error("RvectorPack: n too large");
             if (ell == 1) return ((n + 63) / 64) * 8;
             if (ell == 8) return n;
