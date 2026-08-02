@@ -594,7 +594,10 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         explicit Rvector(size_t n) : n_(n)
         {
             allocData(wordsFor(n));
-            if constexpr (ELL == 1) maskPartialLastWord();
+            if constexpr (ELL == 1) {
+                if (words_ > 0 && n_ % 64 != 0)
+                    data_[words_ - 1] = 0;
+            }
         }
 
         /// @brief Fill all elements with @p val (default 0).
