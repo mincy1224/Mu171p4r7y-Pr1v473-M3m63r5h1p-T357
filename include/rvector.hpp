@@ -269,8 +269,9 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
             dst[i+6] = (bits >> 18) & M;
             dst[i+7] = (bits >> 21) & M;
         }
-        for (; i < n; ++i, ++in) {
-            size_t bit = i * 3;
+        size_t bit = i * 3;
+        for (; i < n; ++i, bit += 3)
+        {
             dst[i] = (src[bit/8] >> (bit%8)) & M;
             if (bit%8 + 3 > 8)
                 dst[i] |= (src[bit/8+1] << (8 - bit%8)) & M;
@@ -823,10 +824,6 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
             if constexpr (ELL == 1) maskPartialLastWord();
         }
 
-    private:
-        static void packImpl(const uint8_t* src, size_t n, uint8_t* dst);
-        static void unpackImpl(const uint8_t* src, size_t n, uint8_t* dst);
-
     public:
 
         /// @brief Get the element at index @p i.
@@ -1305,32 +1302,6 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         {
             return static_cast<uint8_t>(acc & Rvector<ELL>::PER_BYTE_MASK);
         }
-    }
-
-    // SIMD implementations
-
-    template <uint64_t ELL>
-    void Rvector<ELL>::packImpl(const uint8_t* __restrict__ src, size_t n,
-                                uint8_t* __restrict__ dst)
-    {
-        if constexpr (ELL == 2)      _pack2(src, n, dst);
-        else if constexpr (ELL == 3) _pack3(src, n, dst);
-        else if constexpr (ELL == 4) _pack4(src, n, dst);
-        else if constexpr (ELL == 5) _pack5(src, n, dst);
-        else if constexpr (ELL == 6) _pack6(src, n, dst);
-        else if constexpr (ELL == 7) _pack7(src, n, dst);
-    }
-
-    template <uint64_t ELL>
-    void Rvector<ELL>::unpackImpl(const uint8_t* __restrict__ src, size_t n,
-                                uint8_t* __restrict__ dst)
-    {
-        if constexpr (ELL == 2)      _unpack2(src, n, dst);
-        else if constexpr (ELL == 3) _unpack3(src, n, dst);
-        else if constexpr (ELL == 4) _unpack4(src, n, dst);
-        else if constexpr (ELL == 5) _unpack5(src, n, dst);
-        else if constexpr (ELL == 6) _unpack6(src, n, dst);
-        else if constexpr (ELL == 7) _unpack7(src, n, dst);
     }
 
     // ——— pack / unpack free functions ———
