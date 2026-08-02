@@ -64,47 +64,105 @@ guaranteeing the channel outlives all protocol objects.
 pip install -e . -v
 ```
 
-**Ring ops**
+**Ring ops + Rvector** — local, no channels needed
 
 ```python
-mpmt.ring_add(ell=8, a=100, b=200)     # (100+200) mod 256
-mpmt.ring_rand(ell=8)                  # random in Z_256
-mpmt.hash_aes_dm(preimage=b"hi", key=mpmt.get_key_128bits(), ell=8)
-```
+mpmt.ring_add(ell=8, a=100, b=200)          # (100+200) mod 256
+mpmt.ring_rand(ell=8)                        # random in Z_256
 
-**Rvector** — Vectors upon $\mathbb{Z}$, ELL ∈ [1,8]
-
-```python
-v = mpmt.Rvector(ell=4)(size=100)       # 100 elements in Z_16
+v = mpmt.Rvector(ell=4)(size=100)            # 100 elements in Z_16
 v[0] = 5; v.fill(val=0); v.rand_fill()
-mpmt.Rvector(ell=4).add(v, v, v)        # in-place add
+mpmt.Rvector(ell=4).add(v, v, v)             # in-place add
 ```
 
-**ABY3** — 3PC RSS, ELL ∈ [1,6]
+**EMP2** — 2-party additive, ELL ∈ [2,31]
 
+Party 0 (server):
 ```python
-inst = mpmt.ShrRep3(ell=4, party=0)(prev_ch, next_ch)
-share = inst.share_scalar(val=42)
-inst.add(share, share)                  # local
-inst.mul(share, share)                  # network round
-inst.ring_conv(share, ell_to=6)         # binary→arithmetic (ELL=1 only)
+from mpmt.channels import Channel
+ch = Channel(12345)
+inst = mpmt.ShrAdd2(ell=16, party=0)(ch)
+s0 = inst.share_scalar(value=12345)
 ```
 
-**EMP2** — 2PC Additive, ELL ∈ [2,31]
-
+Party 1 (client):
 ```python
-inst = mpmt.ShrAdd2(ell=16, party=0)(peer_ch)
-inst.share_scalar(value=12345)
-inst.equality_test(inst.share_scalar(5), inst.recv_scalar_share())
+from mpmt.channels import Channel
+ch = Channel("localhost", 12345)
+inst = mpmt.ShrAdd2(ell=16, party=1)(ch)
+s1 = inst.recv_scalar_share()
+# s0 + s1 ≡ 12345 (mod 2^16)
 ```
 
-**DPF** — Distributed Point Function, ELL_IN ∈ [13,31], ELL_OUT ∈ [2,6]
+**ABY3** — 3-party RSS, ELL ∈ [1,6]
 
+Ring topology P0→P1→P2→P0. To break the circular connect dependency, at
+least one party must connect before listening (shown here with P1). Other
+deadlock-free orderings work equally well.
+
+Party 0 (listen, then connect):
 ```python
+from mpmt.channels import Channel
+ch_to_p1 = Channel(12000)
+ch_from_p2 = Channel(12002)
+inst = mpmt.ShrRep3(ell=4, party=0)(ch_to_p1, ch_from_p2)
+s0 = inst.share_scalar(val=42)
+```
+
+Party 1 (client to P0, server for P2):
+```python
+from mpmt.channels import Channel
+ch_from_p0 = Channel("localhost", 12000)
+ch_to_p2 = Channel(12001)
+inst = mpmt.ShrRep3(ell=4, party=1)(ch_to_p2, ch_from_p0)
+s1 = inst.recv_scalar_share()
+```
+
+Party 2 (client on both ports):
+```python
+from mpmt.channels import Channel
+ch_from_p1 = Channel("localhost", 12001)
+ch_to_p0 = Channel("localhost", 12002)
+inst = mpmt.ShrRep3(ell=4, party=2)(ch_to_p0, ch_from_p1)
+s2 = inst.recv_scalar_share()
+# s0.this_share + s1.this_share + s2.this_share ≡ 42 (mod 16)
+```
+
+ring_conv — binary to arithmetic, ELL=1 only, target ∈ [2,6]:
+```python
+inst = mpmt.ShrRep3(ell=1, party=0)(ch_to_p1, ch_from_p2)
+conv = inst.ring_conv(inst.share_scalar(val=1), ell_to=6)
+```
+
+**DPF** — function secret sharing, ELL_IN ∈ [13,31], ELL_OUT ∈ [2,6]
+
+Dealer:
+```python
+from mpmt.channels import Channel
+ch_ev0 = Channel(13000)
+ch_ev1 = Channel(13001)
 DC = mpmt.DpfDealer(ell_in=20, ell_out=4)
+d = DC(ch_ev0, ch_ev1)
 k0, k1 = DC.gen(alpha=42, beta=7)
-EC = mpmt.DpfEvaluator(ell_in=20, ell_out=4, party=0)
-EC.eval(k0, mpmt.Rvector(ell=4)(size=1 << 20), cores=4)
+d.send_key(k0, 0); d.send_key(k1, 1)
+out = mpmt.Rvector(ell=4)(size=1 << 20)
+d.reveal(out)  # out[42] == 7
+```
+
+Evaluator 0:
+```python
+ch = mpmt.channels.Channel("localhost", 13000)
+EC = mpmt.DpfEvaluator(ell_in=20, ell_out=4, party=0)(ch)
+key = EC.recv_key()
+EC.eval(key, mpmt.Rvector(ell=4)(size=1 << 20), cores=4)
+```
+
+Evaluator 1:
+```python
+ch = mpmt.channels.Channel("localhost", 13001)
+EC = mpmt.DpfEvaluator(ell_in=20, ell_out=4, party=1)(ch)
+key = EC.recv_key()
+EC.eval(key, mpmt.Rvector(ell=4)(size=1 << 20), cores=4)
 ```
 
 **Run TESTs**
