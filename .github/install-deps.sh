@@ -6,8 +6,16 @@ set -euo pipefail
 PKG="$1"
 REPO="https://github.com/emp-toolkit/${PKG}.git"
 
-echo "Building $PKG ..."
-git clone --depth 1 "$REPO" "/tmp/$PKG"
+# Pinned versions (update manually when upgrading; keep in sync with README)
+declare -A REFS=(
+    ["emp-tool"]="0.3.0"
+    ["emp-ot"]="0.3.0"
+    ["emp-sh2pc"]="0.3.0"
+)
+
+echo "Building $PKG (ref: ${REFS[$PKG]})..."
+git clone --depth 1 --branch "${REFS[$PKG]}" "$REPO" "/tmp/$PKG" 2>/dev/null \
+  || { git clone "$REPO" "/tmp/$PKG" && git -C "/tmp/$PKG" checkout "${REFS[$PKG]}"; }
 cd "/tmp/$PKG"
 
 # emp-tool HEAD is missing <array> in bit.h (breaks GCC 12+ on GitHub runner)

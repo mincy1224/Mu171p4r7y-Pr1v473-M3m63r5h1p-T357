@@ -8,7 +8,7 @@ import pytest
 import mpmt
 
 ELL_IN_RANGE  = list(range(25, 32))   # 25..31
-ELL_OUT       = 8
+ELL_OUT       = 6
 CORES         = [8, 16, 32]
 
 
