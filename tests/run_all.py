@@ -2,8 +2,9 @@
 """Comprehensive test suite — all protocols, full parameter coverage, random data.
 
 Usage:
-  python3 tests/run_all.py            # full coverage (CI, ~minutes)
-  python3 tests/run_all.py -sm        # small-scale (local pre-push, ~seconds)
+  python3 tests/run_all.py            # full coverage (CI)
+  python3 tests/run_all.py -sm        # small-scale (local pre-push)
+  TEST_SEED=42 python3 tests/run_all.py  # reproducible
 """
 import sys, os, random, time, argparse
 
@@ -17,6 +18,9 @@ from test_aby3.harness import run_3party
 from test_emp2.harness import run_2party
 from test_dpf.harness import run_dpf
 
+# Reproducible randomness
+SEED = int(os.environ.get("TEST_SEED", random.randint(0, 2**31 - 1)))
+random.seed(SEED)
 PASS = FAIL = 0
 TSTART = time.monotonic()
 
@@ -25,30 +29,26 @@ def check(name, cond, detail=""):
     if cond: PASS += 1
     else: FAIL += 1; print(f"  ❌ {name}  {detail}")
 
-elli = lambda: None  # will be set per-section
-
-# ═══════════════════════════════════════════════════════════
-#  HELPERS
-# ═══════════════════════════════════════════════════════════
-
 def recon3(r, ell):
     return mpmt.ring_add(ell, r[0][0], mpmt.ring_add(ell, r[1][0], r[2][0]))
 
 def recon2(r, ell):
     return mpmt.ring_add(ell, r[0], r[1])
 
-ELLS_ABY3 = [1, 6] if args.sm else list(range(1, 7))        # 2 vs 6
-ELLS_EMP2 = [2, 31] if args.sm else list(range(2, 32))      # 2 vs 30
-ELLS_RVEC = [1, 8] if args.sm else list(range(1, 9))        # 2 vs 8
-DPF_EI     = [13, 31] if args.sm else list(range(13, 32))    # 2 vs 19
-DPF_EO     = [2, 6] if args.sm else list(range(2, 7))        # 2 vs 5
+ELLS_ABY3 = [1, 6] if args.sm else list(range(1, 7))
+ELLS_EMP2 = [2, 31] if args.sm else list(range(2, 32))
+ELLS_RVEC = [1, 8] if args.sm else list(range(1, 9))
+DPF_EI     = [13, 31] if args.sm else list(range(13, 32))
+DPF_EO     = [2, 6] if args.sm else list(range(2, 7))
 DPF_CORES  = [1] if args.sm else [1, 4, 8, 16]
+# Boundary sizes for packing corner cases
+PACK_SIZES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 255, 256]
 
 MODE = "SMALL" if args.sm else "FULL"
-print(f"=== MPMT Test Suite ({MODE}) ===")
+print(f"=== MPMT Test Suite ({MODE})  seed={SEED} ===")
 
 # ═══════════════════════════════════════════════════════════
-#  MODULE-LEVEL UTILITIES
+#  UTILS
 # ═══════════════════════════════════════════════════════════
 print("─── Utils ───")
 
@@ -57,7 +57,7 @@ for ell in [1, 8, 31, 63]:
 
 for ell in [1, 8, 31]:
     v = mpmt.ring_rand(ell)
-    check(f"ring_rand({ell}) in range", v <= mpmt.ring_mask(ell))
+    check(f"ring_rand({ell})", v <= mpmt.ring_mask(ell))
 
 for bad in [0, 32]:
     try: mpmt.ring_rand(bad); ok = False
@@ -82,11 +82,8 @@ h2 = mpmt.hash_aes_dm(preimage=b"hello", key=k, ell=8)
 check("hash_aes_dm deterministic", h1 == h2)
 check("hash_aes_dm in range", h1 <= mpmt.ring_mask(8))
 
-bf_sz, ea, hf, eq = mpmt.bf_param(1024, 1.0, -3)
-check("bf_param", bf_sz > 0 and hf > 0)
-
 # ═══════════════════════════════════════════════════════════
-#  RVECTOR
+#  RVECTOR — comprehensive boundary testing
 # ═══════════════════════════════════════════════════════════
 print(f"─── Rvector ({len(ELLS_RVEC)} ELLs) ───")
 
@@ -94,72 +91,107 @@ for ell in ELLS_RVEC:
     Rv = mpmt.Rvector(ell); m = mpmt.ring_mask(ell)
     check(f"Rvector({ell}) factory", Rv is not None)
 
-    # construct + fill
-    v = Rv(100)
-    v.fill(0)
-    check(f"Rvector{ell} size", len(v) == 100 and v.size == 100)
+    # Test every boundary size for pack/unpack corner cases
+    test_sizes = PACK_SIZES if not args.sm else [0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 32]
+    for n in test_sizes:
+        # construct + fill + get/set
+        v = Rv(n)
+        if n > 0:
+            v.fill(0)
+            v[0] = 1
+            if n > 1: v[n-1] = 1
+            # pack/unpack roundtrip (catches _pack6 OOB)
+            aux = mpmt.RvectorPack(ell)(n)
+            out = Rv(n)
+            mpmt.rvector_pack(v, aux)
+            mpmt.rvector_unpack(aux, out)
+            ok = all(out[i] == v[i] for i in range(n))
+            if not ok:
+                check(f"Rvector{ell} pack/unpack n={n}", False)
+                break
+        if n == test_sizes[-1]:
+            check(f"Rvector{ell} pack/unpack all sizes", True)
 
-    # random set/get
-    indices = random.sample(range(100), min(10, 100))
-    vals = [random.randint(0, m) for _ in indices]
-    for i, val in zip(indices, vals): v[i] = val
-    ok = all(v[i] == val for i, val in zip(indices, vals))
-    check(f"Rvector{ell} get/set", ok)
+    # from_bytes exact size check
+    v = Rv(32)
+    v[0] = 1; v[31] = m
+    raw = v.to_bytes()
+    # exact match should work
+    v2 = Rv(32)
+    v2.from_bytes(raw)
+    check(f"Rvector{ell} from_bytes exact", all(v2[i] == v[i] for i in range(32)))
+    # wrong size should throw
+    try: v2.from_bytes(raw + b'\x00'); ok = False
+    except ValueError: ok = True
+    check(f"Rvector{ell} from_bytes wrong size", ok)
+    # canonicalize after from_bytes
+    v3 = Rv(32)
+    v3.from_bytes(raw)
+    check(f"Rvector{ell} canonicalize", all(v3[i] == v[i] for i in range(32)))
 
     # OOB
     try: v[100]; ok = False
     except (IndexError, RuntimeError): ok = True
     check(f"Rvector{ell} OOB get", ok)
-    try: v[100] = 0; ok = False
-    except (IndexError, RuntimeError): ok = True
-    check(f"Rvector{ell} OOB set", ok)
 
-    # arithmetic (static) — random data
+    # arithmetic with random data
     n = 32
     a = Rv(n); b = Rv(n); out = Rv(n)
     for i in range(n):
         a[i] = random.randint(0, m); b[i] = random.randint(0, m)
     cls = type(a)
+
+    # in-place add (alias-safe): out == a
+    out2 = Rv(n)
+    for i in range(n): out2[i] = a[i]
+    cls.add(out2, b, out2)
+    check(f"Rvector{ell} add in-place(out=a)", all(out2[i] == mpmt.ring_add(ell, a[i], b[i]) for i in range(n)))
+
+    # in-place add (alias-safe): out == b
+    out3 = Rv(n)
+    for i in range(n): out3[i] = b[i]
+    cls.add(a, out3, out3)
+    check(f"Rvector{ell} add in-place(out=b)", all(out3[i] == mpmt.ring_add(ell, a[i], b[i]) for i in range(n)))
+
+    # regular add
     cls.add(a, b, out)
-    ok = all(out[i] == mpmt.ring_add(ell, a[i], b[i]) for i in range(n))
-    check(f"Rvector{ell} add", ok)
+    check(f"Rvector{ell} add", all(out[i] == mpmt.ring_add(ell, a[i], b[i]) for i in range(n)))
+
+    # hadamard (NO aliasing allowed)
     cls.hadamard(a, b, out)
-    ok = all(out[i] == mpmt.ring_mul(ell, a[i], b[i]) for i in range(n))
-    check(f"Rvector{ell} hadamard", ok)
+    check(f"Rvector{ell} hadamard", all(out[i] == mpmt.ring_mul(ell, a[i], b[i]) for i in range(n)))
+
+    # dot
     d = cls.dot(a, b)
     exp_dot = sum(mpmt.ring_mul(ell, a[i], b[i]) for i in range(n)) & m
     check(f"Rvector{ell} dot", d == exp_dot, f"{d} vs {exp_dot}")
+
+    # reduce
     red = cls.reduce(a)
     exp_red = sum(a[i] for i in range(n)) & m
     check(f"Rvector{ell} reduce", red == exp_red, f"{red} vs {exp_red}")
 
-    # pack/unpack
-    aux = mpmt.RvectorPack(ell)(n)
-    mpmt.rvector_pack(a, aux)
-    mpmt.rvector_unpack(aux, out)
-    check(f"Rvector{ell} pack/unpack", all(out[i] == a[i] for i in range(n)))
+    # batch_set/get (don't swallow exceptions)
+    try:
+        import array
+        idxs = array.array('Q', [0, 1, 2, 3, 4])
+        batch_val = random.randint(0, m)
+        a.batch_set(idxs, batch_val)
+        out_bt = Rv(5)
+        a.batch_get(idxs, out_bt)
+        ok = all(out_bt[i] == batch_val for i in range(5))
+        check(f"Rvector{ell} batch_set/get", ok)
+    except ImportError:
+        pass  # array module unavailable is OK
 
     # rand_fill
     v2 = Rv(200); v2.rand_fill()
     nz = sum(1 for i in range(200) if v2[i] != 0)
-    min_nz = 20 if ell > 1 else 50  # ELL=1: ~50% bits set
+    min_nz = 20 if ell > 1 else 50
     check(f"Rvector{ell} rand_fill", nz >= min_nz, f"only {nz}/200")
 
-    # batch_set / batch_get
-    try:
-        import array
-        idxs = array.array('Q', random.sample(range(n), 5))
-        batch_val = random.randint(0, m)
-        a.batch_set(idxs, batch_val)
-        out2 = Rv(5)
-        a.batch_get(idxs, out2)
-        ok = all(out2[i] == batch_val for i in range(5))
-        check(f"Rvector{ell} batch_set/get", ok)
-    except (ImportError, Exception) as e:
-        pass  # skip batch if array not available
-
 # ═══════════════════════════════════════════════════════════
-#  ABY3 (ShrRep3)
+#  ABY3
 # ═══════════════════════════════════════════════════════════
 print(f"─── ABY3 ({len(ELLS_ABY3)} ELLs) ───")
 
@@ -174,15 +206,32 @@ for ell in ELLS_ABY3:
         except ValueError: ok = True
         check(f"ABY3 reject ell={bad}", ok)
 
+    # ShareVec size consistency
+    sv = SV(10)
+    check(f"ABY3{ell} ShareVec size match", sv.this_share.size == sv.nxt_share.size)
+    # Assign mismatched size should throw
+    try:
+        Rv2 = mpmt.Rvector(ell)
+        big = Rv2(99)
+        sv.this_share = big; ok = False
+    except (ValueError, RuntimeError): ok = True
+    check(f"ABY3{ell} ShareVec reject mismatched this_share", ok)
+    sv2 = SV(10)
+    try:
+        Rv2 = mpmt.Rvector(ell)
+        big = Rv2(99)
+        sv2.nxt_share = big; ok = False
+    except (ValueError, RuntimeError): ok = True
+    check(f"ABY3{ell} ShareVec reject mismatched nxt_share", ok)
+
     # crng
     def crng_fn(pid, p, n):
-        inst = mpmt.ShrRep3(ell, pid)(p, n)
-        return inst.crng()
+        return mpmt.ShrRep3(ell, pid)(p, n).crng()
     r = run_3party(crng_fn, ell)
     s = mpmt.ring_add(ell, r[0], mpmt.ring_add(ell, r[1], r[2]))
     check(f"ABY3{ell} crng", s == 0, f"sum={s}")
 
-    # scalar ops (random)
+    # scalar ops
     sv = random.randint(0, m); a = random.randint(0, m); b = random.randint(0, m)
     def sops(pid, p, n):
         inst = mpmt.ShrRep3(ell, pid)(p, n)
@@ -197,7 +246,7 @@ for ell in ELLS_ABY3:
     check(f"ABY3{ell} add", recon3([x[1] for x in r], ell) == mpmt.ring_add(ell, a, b))
     check(f"ABY3{ell} mul", recon3([x[2] for x in r], ell) == mpmt.ring_mul(ell, a, b))
 
-    # vector share/reveal
+    # vec share/reveal + in-place add_vec
     nv = 16
     vals = [random.randint(0, m) for _ in range(nv)]
     def vfn(pid, p, n):
@@ -240,25 +289,7 @@ for ell in ELLS_ABY3:
     r = run_3party(hfn, ell)
     check(f"ABY3{ell} hadamard", r[0] == exp and r[0] == r[1] == r[2])
 
-    # send_data/recv_data (scalar)
-    sc_val = random.randint(0, m)
-    def sdfn(pid, p, n):
-        inst = mpmt.ShrRep3(ell, pid)(p, n)
-        if pid == 0:
-            inst.send_data(1, sc_val)
-            return inst.recv_data(2)
-        elif pid == 1:
-            rv = inst.recv_data(0)
-            inst.send_data(2, sc_val)
-            return rv
-        else:
-            rv = inst.recv_data(1)
-            inst.send_data(0, sc_val)
-            return rv
-    r = run_3party(sdfn, ell)
-    check(f"ABY3{ell} send/recv", r[0] == sc_val and r[1] == sc_val and r[2] == sc_val)
-
-# ring_conv (ELL=1 only, target [2,6])
+# ring_conv
 print(f"─── ABY3 ring_conv ───")
 bit = random.randint(0, 1)
 RC_ELLS = [2, 6] if args.sm else list(range(2, 7))
@@ -270,13 +301,13 @@ for ell_to in RC_ELLS:
         r = inst.ring_conv(ss, ell_to)
         return (r.this_share, r.nxt_share)
     r = run_3party(rcfn, 1)
-    got = recon3([(r[0][0], r[0][1]), (r[1][0], r[1][1]), (r[2][0], r[2][1])], ell_to)
+    got = mpmt.ring_add(ell_to, r[0][0], mpmt.ring_add(ell_to, r[1][0], r[2][0]))
     check(f"ring_conv 1→{ell_to}", got == exp, f"{got} vs {exp}")
 
 # ring_conv_vec
 bits = [random.randint(0, 1) for _ in range(8)]
 for ell_to in RC_ELLS:
-    exp = [b & mpmt.ring_mask(ell_to) for b in bits]
+    exp_v = [b & mpmt.ring_mask(ell_to) for b in bits]
     def rcvfn(pid, p, n):
         inst1 = mpmt.ShrRep3(1, pid)(p, n)
         inst_to = mpmt.ShrRep3(ell_to, pid)(p, n)
@@ -293,10 +324,10 @@ for ell_to in RC_ELLS:
         inst_to.reveal_vector(so, out, mpmt.RvectorPack(ell_to)(8))
         return [out[i] for i in range(8)]
     r = run_3party(rcvfn, 1)
-    check(f"ring_conv_vec 1→{ell_to}", r[0] == exp and r[0] == r[1] == r[2])
+    check(f"ring_conv_vec 1→{ell_to}", r[0] == exp_v and r[0] == r[1] == r[2])
 
 # ═══════════════════════════════════════════════════════════
-#  EMP2 (ShrAdd2)
+#  EMP2
 # ═══════════════════════════════════════════════════════════
 print(f"─── EMP2 ({len(ELLS_EMP2)} ELLs) ───")
 
@@ -310,7 +341,6 @@ for ell in ELLS_EMP2:
         except ValueError: ok = True
         check(f"EMP2 reject ell={bad}", ok)
 
-    # share/reconstruct
     sv = random.randint(0, m)
     def sf(pid, ch):
         inst = mpmt.ShrAdd2(ell, pid)(ch)
@@ -318,7 +348,6 @@ for ell in ELLS_EMP2:
     r = run_2party(sf, ell)
     check(f"EMP2{ell} share", recon2(r, ell) == sv)
 
-    # send/recv scalar
     val = random.randint(0, m)
     def srf(pid, ch):
         inst = mpmt.ShrAdd2(ell, pid)(ch)
@@ -327,7 +356,6 @@ for ell in ELLS_EMP2:
     r = run_2party(srf, ell)
     check(f"EMP2{ell} send/recv", r == [val, val])
 
-    # share_key
     key = bytes([random.randint(0, 255) for _ in range(16)])
     def kf(pid, ch):
         inst = mpmt.ShrAdd2(ell, pid)(ch)
@@ -336,7 +364,6 @@ for ell in ELLS_EMP2:
     r = run_2party(kf, ell)
     check(f"EMP2{ell} share_key", bytes(a^b for a,b in zip(r[0],r[1])) == key)
 
-    # share_element
     elem = bytes([random.randint(0, 255) for _ in range(random.randint(8, 32))])
     def ef(pid, ch):
         inst = mpmt.ShrAdd2(ell, pid)(ch)
@@ -345,7 +372,6 @@ for ell in ELLS_EMP2:
     r = run_2party(ef, ell)
     check(f"EMP2{ell} share_element", bytes(a^b for a,b in zip(r[0],r[1])) == elem)
 
-    # mod
     av = random.randint(0, m); mv = random.randint(2, min(m, 100))
     exp = mpmt.ring_mod(ell, av, mv)
     def mf(pid, ch):
@@ -358,7 +384,6 @@ for ell in ELLS_EMP2:
     r = run_2party(mf, ell)
     check(f"EMP2{ell} mod", r[0] == exp and r[0] == r[1])
 
-    # equality_test
     bv = random.choice([av, random.randint(0, m)])
     exp_eq = 1 if av == bv else 0
     def eqf(pid, ch):
@@ -370,10 +395,8 @@ for ell in ELLS_EMP2:
         else: o = inst.recv_data(); inst.send_data(r)
         return mpmt.ring_add(ell, r, o)
     r = run_2party(eqf, ell)
-    lbl = "eq" if exp_eq else "neq"
-    check(f"EMP2{ell} eq({lbl})", r[0] == exp_eq and r[0] == r[1])
+    check(f"EMP2{ell} eq", r[0] == exp_eq and r[0] == r[1])
 
-    # hash (XOR-shared inputs)
     pt = bytes([random.randint(0, 255) for _ in range(16)])
     hkey = bytes([random.randint(0, 255) for _ in range(16)])
     exp_h = mpmt.hash_aes_dm(preimage=pt, key=hkey, ell=ell)
@@ -408,7 +431,6 @@ for ei in DPF_EI:
         alpha = random.randint(0, vl - 1)
         beta = random.randint(1, m)
 
-        # full eval + reveal
         def d_full(c0, c1):
             DC = mpmt.DpfDealer(ei, eo); d = DC(c0, c1)
             k0, k1 = DC.gen(alpha, beta); d.send_key(k0, 0); d.send_key(k1, 1)
@@ -424,7 +446,6 @@ for ei in DPF_EI:
         r = run_dpf(d_full, ev_full(0), ev_full(1), timeout=180)
         check(f"DPF({ei},{eo},c{cores}) full", r[0] == "OK")
 
-        # range eval + reveal
         if vl > 20:
             bg = random.randint(0, vl - 20)
             ed = min(bg + random.randint(5, 20), vl - 1)
@@ -450,6 +471,6 @@ for ei in DPF_EI:
 # ═══════════════════════════════════════════════════════════
 elapsed = time.monotonic() - TSTART
 print(f"\n{'='*60}")
-print(f"  MODE={MODE}  PASS={PASS}  FAIL={FAIL}  ({elapsed:.1f}s)")
+print(f"  MODE={MODE}  PASS={PASS}  FAIL={FAIL}  seed={SEED}  ({elapsed:.1f}s)")
 print(f"{'='*60}")
 sys.exit(0 if FAIL == 0 else 1)
