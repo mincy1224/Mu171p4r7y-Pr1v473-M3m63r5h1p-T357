@@ -155,8 +155,13 @@ template <uint64_t ELL> static void bind_rvector(nb::module_& m, const char* nam
             "from_bytes",
             [](Rv& v, const nb::bytes& b)
             {
-                size_t n = std::min<size_t>(b.size(), v.bytesSize());
-                std::memcpy(v.data(), b.c_str(), n);
+                size_t expected = v.bytesSize();
+                if (b.size() != expected)
+                    throw std::invalid_argument(
+                        "from_bytes: expected " + std::to_string(expected)
+                        + " bytes, got " + std::to_string(b.size()));
+                std::memcpy(v.data(), b.c_str(), expected);
+                v.canonicalize();
             }
         )
 
@@ -247,6 +252,7 @@ template <uint64_t ELL> struct RingVectorTransport
     {
         packRvec(vec, auxBuf);
         io_->send_data(auxBuf.data(), auxBuf.size());
+        io_->flush();
     }
     void recv_vector(math::Rvector<ELL>& vec, math::RvectorPack& auxBuf)
     {

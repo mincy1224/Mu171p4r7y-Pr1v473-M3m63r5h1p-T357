@@ -340,8 +340,26 @@ template <uint64_t ELL> static void bind_rss3_share_vec(nb::module_& m, const ch
 
     nb::class_<SV>(m, name)
         .def(nb::init<size_t>(), "size"_a, "Allocate a zero-initialised share vector of given size")
-        .def_rw("this_share", &SV::thisShare, "First RSS component  (Rvector)")
-        .def_rw("nxt_share", &SV::nxtShare, "Second RSS component (Rvector)")
+        .def_prop_rw("this_share",
+            [](const SV& sv) -> const bind::RVECTOR<ELL>& { return sv.thisShare; },
+            [](SV& sv, const bind::RVECTOR<ELL>& v) {
+                if (v.size() != sv.nxtShare.size())
+                    throw std::invalid_argument(
+                        "this_share size (" + std::to_string(v.size())
+                        + ") must match nxt_share size (" + std::to_string(sv.nxtShare.size()) + ")");
+                sv.thisShare = v;
+            },
+            "First RSS component  (Rvector)")
+        .def_prop_rw("nxt_share",
+            [](const SV& sv) -> const bind::RVECTOR<ELL>& { return sv.nxtShare; },
+            [](SV& sv, const bind::RVECTOR<ELL>& v) {
+                if (v.size() != sv.thisShare.size())
+                    throw std::invalid_argument(
+                        "nxt_share size (" + std::to_string(v.size())
+                        + ") must match this_share size (" + std::to_string(sv.thisShare.size()) + ")");
+                sv.nxtShare = v;
+            },
+            "Second RSS component (Rvector)")
         .def_prop_ro("size", &SV::size);
 
     sv_types[ELL] = m.attr(name);
