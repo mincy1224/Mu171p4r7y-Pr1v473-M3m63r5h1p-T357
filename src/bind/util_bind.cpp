@@ -61,17 +61,17 @@ uintptr_t netio_register(std::shared_ptr<emp::NetIO> sp)
 
 namespace {
 
-    /// Look up a NetIO raw pointer from its handle (throws if invalid).
-    /// The pointee stays alive because the registry holds a shared_ptr.
-    /// @warning Caller must not use the pointer after releasing the registry entry.
-    inline emp::NetIO* _lookup(uintptr_t handle)
+    /// Look up a NetIO shared_ptr from its handle. The returned shared_ptr
+    /// keeps the NetIO alive for the duration of the call, preventing
+    /// concurrent release from destroying it mid-operation.
+    inline std::shared_ptr<emp::NetIO> _lookup(uintptr_t handle)
     {
         std::lock_guard lock(g_registry_mutex);
         auto it = g_registry.find(handle);
         if (it == g_registry.end())
             throw std::runtime_error(
                 "NetIO handle " + std::to_string(handle) + " is no longer valid");
-        return it->second.get();
+        return it->second;
     }
 
 } // anonymous namespace
@@ -226,7 +226,7 @@ void bind_util(nb::module_& m)
             // Extract C-string from Python object BEFORE releasing the GIL
             // (nb::object destructor needs the GIL; manually scope the release).
             auto [buf, len] = _getByteBuffer(data);
-            emp::NetIO* p = _lookup(handle);
+            auto p = _lookup(handle);
             {
                 nb::gil_scoped_release release;
                 p->send_data(buf, static_cast<size_t>(len));
@@ -246,7 +246,7 @@ void bind_util(nb::module_& m)
                 throw std::invalid_argument("_netio_recv: buf must be a bytearray");
             char* data = PyByteArray_AsString(py_buf);
             Py_ssize_t len = PyByteArray_Size(py_buf);
-            emp::NetIO* p = _lookup(handle);
+            auto p = _lookup(handle);
             {
                 nb::gil_scoped_release release;
                 p->recv_data(data, static_cast<size_t>(len));

@@ -51,6 +51,9 @@ template <ShrRep3Pid PID, uint64_t ELL> struct Rss3T
 
     // shared_ptr keeps channels alive while protocol object exists
     std::shared_ptr<emp::IOChannel> srv_, cli_;
+    /// @warning aby3_ must be destroyed BEFORE srv_/cli_ — the worker
+    /// threads hold raw IOChannel pointers into these shared_ptrs.
+    /// Closing the IO first would cause use-after-free in the workers.
     std::unique_ptr<Aby3Type> aby3_;
 
     Rss3T() = default;
