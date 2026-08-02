@@ -352,9 +352,11 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         }
         if (i < n) {
             uint32_t bits = 0;
-            for (size_t j = 0; i + j < n; ++j)
+            size_t rem = n - i;
+            for (size_t j = 0; j < rem; ++j)
                 bits |= ((uint32_t)(src[i+j] & M)) << (j * 6);
-            for (size_t b = 0; b < 3; ++b)
+            size_t remBytes = (rem * 6 + 7) / 8;
+            for (size_t b = 0; b < remBytes; ++b)
                 dst[out++] = (uint8_t)(bits >> (b * 8));
         }
         return out;
@@ -534,6 +536,26 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
             data_[words_ - 1] &= (uint64_t{1} << rem) - 1;
         }
 
+    public:
+        /// Bring the vector into canonical form: mask padding bits (ELL=1)
+        /// and clear high bits of each element (ELL=2..7).  ELL=8 is a
+        /// no-op because every byte is already a valid ring element.
+        /// Callers should invoke this after any raw-byte import
+        /// (from_bytes, unpack, recv_vector, load).
+        void canonicalize()
+        {
+            if constexpr (ELL == 1)
+            {
+                maskPartialLastWord();
+            }
+            else if constexpr (ELL != 8)
+            {
+                for (size_t i = 0; i < words_; ++i)
+                    data_[i] &= PER_BYTE_MASK;
+            }
+        }
+
+    private:
         static constexpr size_t wordsFor(size_t n)
         {
             return (n + ELEMS_PER_WORD - 1) / ELEMS_PER_WORD;
@@ -870,6 +892,8 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         /// @brief Batch-get: write elements at @p indices[0..n) into @p out[0..n).
         void batchGet(const uint64_t* indices, size_t n, Rvector& out) const
         {
+            if (&out == this)
+                throw std::invalid_argument("batchGet: output must not alias source");
             if (out.size() < n)
                 throw std::invalid_argument("batchGet: out.size() must be >= n");
             for (size_t k = 0; k < n; ++k)
@@ -903,8 +927,8 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         }
 
         /// @name Element-wise arithmetic
-        /// @note The output parameter @p out must NOT alias @p a or @p b.
-        ///       Internal kernels use @c __restrict__ pointers for SIMD performance.
+        /// @note add / sub support in-place (out may alias a or b).
+        ///       hadamard forbids aliasing (out must not alias inputs).
         /// @{
 
         /// @brief out[i] = (a[i] + b[i]) mod 2^ELL
@@ -1015,6 +1039,7 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
     // CRITICAL: extract raw pointers BEFORE the loop with __restrict__,
     // otherwise clang cannot deduce array bounds and falls back to scalar code.
 
+    // Note: out may alias a or b (ABY3 add_vec supports in-place).
     template <uint64_t ELL>
     inline void _add(const Rvector<ELL>& a, const Rvector<ELL>& b, Rvector<ELL>& out)
     {
@@ -1329,6 +1354,7 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         else if constexpr (ELL == 5)      _unpack5(auxBuf.data(), dst.size(), reinterpret_cast<uint8_t*>(dst.data()));
         else if constexpr (ELL == 6)      _unpack6(auxBuf.data(), dst.size(), reinterpret_cast<uint8_t*>(dst.data()));
         else if constexpr (ELL == 7)      _unpack7(auxBuf.data(), dst.size(), reinterpret_cast<uint8_t*>(dst.data()));
+        dst.canonicalize();
     }
 
 } // namespace scucse::crypto::math
