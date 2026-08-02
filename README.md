@@ -48,82 +48,72 @@ guaranteeing the channel outlives all protocol objects.
 | cloudpickle | >= 3.1 |
 | Python | >= 3.10 |
 
-## Demo Usage
+## Tutorials
 
-```python
-import mpmt
+| Directory | Topics |
+|-----------|--------|
+| [base/](./tutorial/base/) | ring operations, rvector, share vectors |
+| [building_blocks/](./tutorial/building_blocks/) | rep3 (ABY3), add2 (EMP2), dpf |
+| [net/](./tutorial/net/) | channels, ring transport |
+| [protocol/](./tutorial/protocol/) | handler, query, set holder, tree cache |
+| [application/](./tutorial/application/) | Flask demo |
 
-# ── Ring arithmetic ──────────────────────────────
-v = mpmt.ring_add(ell=8, a=100, b=200)          # (100+200) mod 256
-r = mpmt.ring_rand(ell=8)                       # random in Z_256
-h = mpmt.hash_aes_dm(preimage=b"hello",
-                     key=mpmt.get_key_128bits(),
-                     ell=8)
-
-# ── Rvector ──────────────────────────────────────
-Rv = mpmt.Rvector(ell=4)
-v = Rv(size=100)                                # 100-element Z_16 vector
-v[0] = 5; v.fill(val=0); v.rand_fill()
-
-# ── ABY3 (3-party RSS) ──────────────────────────
-ShrRep3 = mpmt.ShrRep3(ell=4, party=0)          # ELL=4, party 0
-inst = ShrRep3(prev_channel, next_channel)
-share = inst.share_scalar(val=42)               # → ShrRep3ShareScalar
-
-# ── EMP2 (2-party additive) ─────────────────────
-ShrAdd2 = mpmt.ShrAdd2(ell=16, party=0)          # ELL=16, party 0
-inst2 = ShrAdd2(peer_channel)
-inst2.share_scalar(value=12345)
-
-# ── DPF ─────────────────────────────────────────
-Dealer = mpmt.DpfDealer(ell_in=20, ell_out=4)
-k0, k1 = Dealer.gen(alpha=42, beta=7)
-```
-
-**Tutorials** ([tutorial/](./tutorial/)):  
-`base/` — ring operations · rvector · share vectors  
-`building_blocks/` — rep3 (ABY3) · add2 (EMP2) · dpf  
-`net/` — channels · ring transport  
-`protocol/` — handler · query · set holder · tree cache  
-`application/` — Flask demo
-
-## Build
-
+## Quick Start
+**Build & Install**
 ```bash
 pip install -e . -v
 ```
 
-Or manually:
+**Ring ops**
 
-```bash
-mkdir -p build && cd build
-cmake .. -GNinja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang-15 \
-  -DCMAKE_CXX_COMPILER=clang++-15 \
-  -DCMAKE_PREFIX_PATH="$HOME/.local/lib/python3.10/site-packages/nanobind/cmake" \
-  -DSKBUILD=ON
-ninja
+```python
+mpmt.ring_add(ell=8, a=100, b=200)     # (100+200) mod 256
+mpmt.ring_rand(ell=8)                  # random in Z_256
+mpmt.hash_aes_dm(preimage=b"hi", key=mpmt.get_key_128bits(), ell=8)
 ```
 
-Sanitizer build (development):
+**Rvector** — Vectors upon $\mathbb{Z}$, ELL ∈ [1,8]
 
-```bash
-cmake .. -DMPMT_SANITIZE=address,undefined
+```python
+v = mpmt.Rvector(ell=4)(size=100)       # 100 elements in Z_16
+v[0] = 5; v.fill(val=0); v.rand_fill()
+mpmt.Rvector(ell=4).add(v, v, v)        # in-place add
 ```
 
-## Continuous Integration
+**ABY3** — 3PC RSS, ELL ∈ [1,6]
 
-Weekly on GitHub Actions (`.github/workflows/ci.yml`): every Monday + manually.
-Builds emp-toolkit (cached), compiles mpmt, runs `python3 tests/run_all.py`.
+```python
+inst = mpmt.ShrRep3(ell=4, party=0)(prev_ch, next_ch)
+share = inst.share_scalar(val=42)
+inst.add(share, share)                  # local
+inst.mul(share, share)                  # network round
+inst.ring_conv(share, ell_to=6)         # binary→arithmetic (ELL=1 only)
+```
 
+**EMP2** — 2PC Additive, ELL ∈ [2,31]
+
+```python
+inst = mpmt.ShrAdd2(ell=16, party=0)(peer_ch)
+inst.share_scalar(value=12345)
+inst.equality_test(inst.share_scalar(5), inst.recv_scalar_share())
+```
+
+**DPF** — Distributed Point Function, ELL_IN ∈ [13,31], ELL_OUT ∈ [2,6]
+
+```python
+DC = mpmt.DpfDealer(ell_in=20, ell_out=4)
+k0, k1 = DC.gen(alpha=42, beta=7)
+EC = mpmt.DpfEvaluator(ell_in=20, ell_out=4, party=0)
+EC.eval(k0, mpmt.Rvector(ell=4)(size=1 << 20), cores=4)
+```
+
+**Run TESTs**
 ```bash
-python3 tests/run_all.py -sm   # local pre-push (30s, boundaries only)
-python3 tests/run_all.py        # full coverage (all parameters)
+python3 tests/run_all.py -sm        # run tests (2s)
 ```
 
 ## Disclaimer
-This code is intended solely for **ACADEMIC RESEARCH PURPOSES** and has not undergone a formal **PRODUCTION SECURITY AUDIT**. It is provided **“AS IS,”** without any **EXPRESS OR IMPLIED WARRANTIES**. **USE IT AT YOUR OWN RISK.**
+This code is intended solely for **ACADEMIC RESEARCH PURPOSES** and has not undergone a formal **PRODUCTION SECURITY AUDIT**. It is provided **"AS IS,"** without any **EXPRESS OR IMPLIED WARRANTIES**. **USE IT AT YOUR OWN RISK.**
 
 ## References
 
