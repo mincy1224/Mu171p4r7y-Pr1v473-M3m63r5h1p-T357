@@ -105,6 +105,12 @@ template <ShrRep3Pid PID, uint64_t ELL> struct Rss3T
 
     void recv_share_vec(ShareVecType& sv)
     {
+        if (sv.size() == 0)
+        {
+            throw std::invalid_argument(
+                "recv_share_vec: ShareVec must be pre-allocated with non-zero size"
+            );
+        }
         aby3_->recvShare(sv);
     }
 
