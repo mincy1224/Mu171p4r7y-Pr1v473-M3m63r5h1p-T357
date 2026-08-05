@@ -1,344 +1,387 @@
-"""Tree cache — complete binary tree for RSS3 BF-share aggregation.
+import json
+import os
 
-φ bijection maps token ↔ node index.  ``_buf[i]`` ∈ {⊥, NOT_LOADED, ShareVec}.
-Insert uses top-down splitting; remove uses heap-style deletion.
-``get_merge_schedule`` returns a bottom-up ordered merge plan.
-
-@author  mincy
-@ref     Based on the binary-tree aggregation design, heap-style removal
-"""
-
-from __future__ import annotations
-
-import math
-from dataclasses import dataclass
-from typing import Optional
-
-# Sentinel: share is clean but currently on disk (not in memory).
-NOT_LOADED = object()
-
-
-@dataclass(frozen=True)
-class MergeStep:
-    """One merge instruction.
-
-    The parent node needs to be recomputed from its two children.
-    Left child  = ``2 * parent + 1``
-    Right child = ``2 * parent + 2``
-
-    When only one child is available (after a quit created a structural
-    hole), the merge executor simply copies the surviving child's value
-    into *parent* (pass-through).
-    """
-    parent: int
-
+import mpmt
+import secrets
+from pathlib import Path
 
 class TreeCache:
-    """Complete-binary-tree cache for RSS3 Bloom-filter shares.
+    def __init__(
+        self,
+        *,
+        storage_dir: str,
+        bf_size: int,
+        prefetch_num: int,
+    ):
+        storage_path = Path(storage_dir)
+        storage_path.mkdir(parents=True, exist_ok=True)
 
-    Parameters
-    ----------
-    max_holders : int
-        Maximum number of set holders this tree can accommodate.
-        Determines the tree height ``h = ⌈log₂(max_holders)⌉ + 1``
-        and the maximum node count ``2ʰ − 1``.
-    """
+        self.storage_dir = str(storage_path)
+        self.meta_path = storage_path / "meta.json"
+        self.corrupted = False
+        self.phi_f: dict[str, int] = {}
+        self.phi_r: dict[int, str] = {}
+        self.leaf_num = 0
 
-    def __init__(self, max_holders: int):
-        if max_holders < 1:
-            raise ValueError("max_holders must be >= 1")
+        if not self.meta_path.exists():
+            self.prefetch_buf = [
+                mpmt.Rvector(ell=1)(bf_size)
+                for _ in range(prefetch_num)
+            ]
+            return
 
-        self._max_holders = max_holders
-        self._h = math.ceil(math.log2(max_holders)) + 1
-        self._max_nodes = (1 << self._h) - 1
-
-        # Tree storage — see module docstring for the three states.
-        self._buf: list[Optional[object]] = [None] * self._max_nodes
-
-        # Bijection φ : token ↔ node index.
-        # Only leaf nodes (holders) are tracked here.
-        self._phi: dict[bytes, int] = {}
-        self._phi_inv: dict[int, bytes] = {}
-
-        # Number of *active* holders currently in the tree.
-        self._count: int = 0
-
-    # ------------------------------------------------------------------
-    #  Read-only properties
-    # ------------------------------------------------------------------
-
-    @property
-    def max_holders(self) -> int:
-        """Maximum number of holders this tree can contain."""
-        return self._max_holders
-
-    @property
-    def height(self) -> int:
-        """Tree height (root = layer 0, deepest leaves = layer h-1)."""
-        return self._h
-
-    @property
-    def max_nodes(self) -> int:
-        """Total number of array slots (indices 0 … max_nodes-1)."""
-        return self._max_nodes
-
-    @property
-    def count(self) -> int:
-        """Current number of active holders in the tree."""
-        return self._count
-
-    @property
-    def root_share(self):
-        """The root share B(∪Xᵢ), or ``None`` if not yet computed."""
-        return self._buf[0] if self._buf[0] is not None else None
-
-    # ------------------------------------------------------------------
-    #  φ mapping
-    # ------------------------------------------------------------------
-
-    def token_of(self, idx: int) -> Optional[bytes]:
-        """Return the token stored at node *idx*, or ``None``."""
-        return self._phi_inv.get(idx)
-
-    def index_of(self, token: bytes) -> Optional[int]:
-        """Return the node index for *token*, or ``None``."""
-        return self._phi.get(token)
-
-    def share_at(self, idx: int):
-        """Return the share at node *idx*.
-
-        May be ``None`` (⊥ / dirty), ``NOT_LOADED`` (clean, on disk),
-        or a ``ShrRep3ShareVec`` (clean, in memory).
-        """
-        if idx < 0 or idx >= self._max_nodes:
-            raise IndexError(f"index {idx} out of range [0, {self._max_nodes})")
-        return self._buf[idx]
-
-    # ------------------------------------------------------------------
-    #  Insert  (Phase 3: top-down splitting   c = count − 1)
-    # ------------------------------------------------------------------
-
-    def insert(self, token: bytes, share) -> None:
-        """Insert the next holder's share using Phase 3 top-down splitting.
-
-        For the *k*-th holder (k ≥ 2), the node ``c = count − 1`` is
-        split: its current content moves to the left child (2c+1), and
-        the new share is placed at the right child (2c+2).  The parent
-        *c* is then marked ⊥ and will be recomputed during the next
-        aggregate.
-
-        Parameters
-        ----------
-        token : bytes
-            Holder's unique 16-byte identifier.
-        share :
-            RSS3 share (``ShrRep3ShareVec``) of the holder's Bloom filter.
-
-        Raises
-        ------
-        RuntimeError
-            If the tree is already full.
-        KeyError
-            If *token* is already present.
-        """
-        if self._count >= self._max_holders:
+        try:
+            with self.meta_path.open("r", encoding="utf-8") as f:
+                meta_data = json.load(f)
+        except Exception as e:
+            self.corrupted = True
             raise RuntimeError(
-                f"TreeCache is full ({self._max_holders} holders max)"
+                "meta.json is malformed or corrupt"
+            ) from e
+
+        if not isinstance(meta_data, dict):
+            self.corrupted = True
+            raise RuntimeError(
+                "meta.json is not a JSON object"
             )
-        if token in self._phi:
-            raise KeyError(f"token {token.hex()} already in tree")
 
-        if self._count == 0:
-            # First holder — place at root.
-            self._buf[0] = share
-            self._phi[token] = 0
-            self._phi_inv[0] = token
-            self._count = 1
-            return
+        required = {
+            "state",
+            "leaf_num",
+            "phi_f",
+            "phi_r",
+        }
 
-        # Phase 3 split: c = count − 1
-        c = self._count - 1
-        left = 2 * c + 1
-        right = 2 * c + 2
+        if not required.issubset(meta_data):
+            self.corrupted = True
+            raise RuntimeError(
+                "meta.json is missing required fields"
+            )
 
-        # Move old content to left child.
-        self._buf[left] = self._buf[c]
-        old_token = self._phi_inv.pop(c, None)
-        if old_token is not None:
-            self._phi[old_token] = left
-            self._phi_inv[left] = old_token
+        if meta_data["state"] != "valid":
+            self.corrupted = True
+            raise RuntimeError(
+                "TreeCache state is not valid"
+            )
 
-        # Place new share at right child.
-        self._buf[right] = share
-        self._phi[token] = right
-        self._phi_inv[right] = token
+        leaf_num = meta_data["leaf_num"]
+        phi_f = meta_data["phi_f"]
+        phi_r = meta_data["phi_r"]
 
-        # Parent is now an internal node → mark ⊥.
-        self._buf[c] = None
+        if (
+            isinstance(leaf_num, bool)
+            or not isinstance(leaf_num, int)
+            or leaf_num < 0
+        ):
+            self.corrupted = True
+            raise RuntimeError(
+                "leaf_num is not a valid non-negative integer"
+            )
 
-        self._count += 1
+        if not isinstance(phi_f, dict):
+            self.corrupted = True
+            raise RuntimeError(
+                "phi_f is not a JSON object"
+            )
 
-    # ------------------------------------------------------------------
-    #  Update  (replace leaf share)
-    # ------------------------------------------------------------------
+        if not isinstance(phi_r, dict):
+            self.corrupted = True
+            raise RuntimeError(
+                "phi_r is not a JSON object"
+            )
 
-    def update(self, token: bytes, new_share) -> None:
-        """Replace a holder's share and mark the path to root as dirty.
+        new_phi_f: dict[str, int] = {}
+        new_phi_r: dict[int, str] = {}
+        used_node_ids: set[int] = set()
 
-        Parameters
-        ----------
-        token : bytes
-            Holder's unique identifier.
-        new_share :
-            New RSS3 share replacing the old one.
-
-        Raises
-        ------
-        KeyError
-            If *token* is not in the tree.
-        """
-        idx = self._phi.get(token)
-        if idx is None:
-            raise KeyError(f"token {token.hex()} not in tree")
-
-        self._buf[idx] = new_share
-        self._mark_path_dirty(idx)
-
-    # ------------------------------------------------------------------
-    #  Remove / Quit  (heap-style deletion)
-    # ------------------------------------------------------------------
-
-    def remove(self, token: bytes) -> None:
-        """Remove a holder using heap-style deletion (Paper Quit protocol).
-
-        1. Swap the last leaf with the deleted position.
-        2. Delete the last leaf (shrinking the tree).
-        3. Mark paths from both affected positions to root as ⊥.
-
-        Parameters
-        ----------
-        token : bytes
-            Holder's unique identifier to remove.
-
-        Raises
-        ------
-        KeyError
-            If *token* is not in the tree.
-        """
-        idx = self._phi.get(token)
-        if idx is None:
-            raise KeyError(f"token {token.hex()} not in tree")
-
-        # Find the last active leaf.
-        last_idx = max(self._phi_inv.keys())
-
-        if idx == last_idx:
-            # Removing the last leaf — simple case: just delete it.
-            self._buf[last_idx] = None
-            del self._phi[token]
-            del self._phi_inv[last_idx]
-            self._count -= 1
-
-            # Parent of the removed leaf → ⊥.
-            if last_idx > 0:
-                self._mark_path_dirty(last_idx)
-            return
-
-        # Heap-style: move last leaf's content to the deleted position.
-        last_token = self._phi_inv[last_idx]
-
-        self._buf[idx] = self._buf[last_idx]
-        self._phi[last_token] = idx
-        self._phi_inv[idx] = last_token
-
-        # Delete the last position.
-        self._buf[last_idx] = None
-        del self._phi_inv[last_idx]
-        del self._phi[token]  # removed token
-
-        self._count -= 1
-
-        # Both positions' ancestors need recomputation.
-        self._mark_path_dirty(idx)
-        if last_idx > 0:
-            self._mark_path_dirty(last_idx)
-
-    # ------------------------------------------------------------------
-    #  Merge schedule
-    # ------------------------------------------------------------------
-
-    def get_merge_schedule(self) -> list[MergeStep]:
-        """Return the ordered list of merges for all ⊥ internal nodes.
-
-        Scans from the deepest layer upward so that children are always
-        recomputed before their parents.  Each step identifies a parent
-        node whose children are non-⊥ (i.e. data is available).
-
-        A parent with exactly one non-⊥ child still appears in the
-        schedule — the merge executor handles this as a *pass-through*
-        (copy the surviving child's value).
-
-        Returns
-        -------
-        list[MergeStep]
-            Ordered bottom-up; empty if the tree is clean.
-        """
-        schedule: list[MergeStep] = []
-        scheduled: set[int] = set()  # nodes whose merge is already planned
-
-        # Scan internal-node layers bottom-up: h-2 (deepest parents)
-        # down to 0 (root).  A node at layer L has children at L+1.
-        # Leaves (layer h-1) cannot be ⊥ parents — skip them.
-        for layer in range(self._h - 2, -1, -1):
-            layer_start = (1 << layer) - 1
-            layer_end = min((1 << (layer + 1)) - 1, self._max_nodes)
-
-            for node in range(layer_start, layer_end):
-                if self._buf[node] is not None:
-                    continue  # clean — nothing to do
-
-                left = 2 * node + 1
-                right = 2 * node + 2
-
-                left_ok = (
-                    left < self._max_nodes
-                    and (self._buf[left] is not None or left in scheduled)
-                )
-                right_ok = (
-                    right < self._max_nodes
-                    and (self._buf[right] is not None or right in scheduled)
+        for token, node_id in phi_f.items():
+            if not isinstance(token, str):
+                self.corrupted = True
+                raise RuntimeError(
+                    "phi_f key is not a string"
                 )
 
-                if left_ok or right_ok:
-                    schedule.append(MergeStep(parent=node))
-                    scheduled.add(node)
+            if (
+                isinstance(node_id, bool)
+                or not isinstance(node_id, int)
+                or node_id < 0
+            ):
+                self.corrupted = True
+                raise RuntimeError(
+                    "phi_f value is not a valid non-negative integer"
+                )
 
-        return schedule
+            if node_id in used_node_ids:
+                self.corrupted = True
+                raise RuntimeError(
+                    "phi_f contains duplicate node_id"
+                )
 
-    # ------------------------------------------------------------------
-    #  Leaf enumeration
-    # ------------------------------------------------------------------
+            used_node_ids.add(node_id)
+            new_phi_f[token] = node_id
 
-    def leaf_indices(self) -> list[int]:
-        """Return the node index of every active holder (sorted by index)."""
-        return sorted(self._phi_inv.keys())
+        for raw_node_id, token in phi_r.items():
+            try:
+                node_id = int(raw_node_id)
+            except (TypeError, ValueError) as e:
+                self.corrupted = True
+                raise RuntimeError(
+                    "phi_r key is not a valid integer"
+                ) from e
 
-    def dirty_nodes(self) -> list[int]:
-        """Return indices of all ⊥ nodes eligible for merge (debug aid).
+            if node_id < 0:
+                self.corrupted = True
+                raise RuntimeError(
+                    "phi_r key is negative"
+                )
 
-        These are the parents that :meth:`get_merge_schedule` would return.
-        """
-        schedule = self.get_merge_schedule()
-        return [s.parent for s in schedule]
+            if not isinstance(token, str):
+                self.corrupted = True
+                raise RuntimeError(
+                    "phi_r value is not a string"
+                )
 
-    # ------------------------------------------------------------------
-    #  Helpers
-    # ------------------------------------------------------------------
+            if node_id in new_phi_r:
+                self.corrupted = True
+                raise RuntimeError(
+                    "phi_r contains duplicate node_id"
+                )
 
-    def _mark_path_dirty(self, leaf_idx: int) -> None:
-        """Mark all ancestors of *leaf_idx* as ⊥, up to (but not including)
-        the root's parent (which doesn't exist)."""
-        idx = leaf_idx
-        while idx > 0:
-            idx = (idx - 1) // 2  # parent
-            self._buf[idx] = None
+            new_phi_r[node_id] = token
+
+        if len(new_phi_f) != len(new_phi_r):
+            self.corrupted = True
+            raise RuntimeError(
+                "phi_f and phi_r have different lengths"
+            )
+
+        for token, node_id in new_phi_f.items():
+            if new_phi_r.get(node_id) != token:
+                self.corrupted = True
+                raise RuntimeError(
+                    "phi_f and phi_r are not mutual inverses"
+                )
+
+        expected_node_count = 0 if leaf_num == 0 else 2 * leaf_num - 1
+        expected_node_ids = set(range(1, expected_node_count + 1))
+        actual_node_ids = set(new_phi_r)
+
+        if actual_node_ids != expected_node_ids:
+            self.corrupted = True
+            raise RuntimeError(
+                "node_id sequence is invalid: expected consecutive "
+                f"integers from 1 to {expected_node_count}"
+            )
+
+        self.leaf_num = leaf_num
+        self.phi_f = new_phi_f
+        self.phi_r = new_phi_r
+        self.corrupted = False
+
+        self.prefetch_buf = [
+            mpmt.Rvector(ell=1)(bf_size)
+            for _ in range(prefetch_num)
+        ]
+
+    def _mark_corrupted(self) -> None:
+        self.corrupted = True
+        meta_data = {
+            "state": "dirty",
+            "leaf_num": self.leaf_num,
+            "phi_f": self.phi_f,
+            "phi_r": {
+                str(node_id): token
+                for node_id, token in self.phi_r.items()
+            },
+        }
+
+        try:
+            with open(self.meta_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    meta_data,
+                    f,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+        except Exception:
+            raise
+
+    def _mark_valid(self) -> None:
+        meta_data = {
+            "state": "valid",
+            "leaf_num": self.leaf_num,
+            "phi_f": self.phi_f,
+            "phi_r": {
+                str(node_id): token
+                for node_id, token in self.phi_r.items()
+            },
+        }
+
+        try:
+            with open(self.meta_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    meta_data,
+                    f,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+        except Exception:
+            raise
+
+        self.corrupted = False
+
+    def _new_token(self):
+        while (token := secrets.token_hex(16)) in self.phi_f:
+            pass
+
+        return token
+
+    def insert(
+        self, *,
+        node,
+        aux_packbuf
+    )->str:
+        if self.corrupted:
+            raise RuntimeError(
+                "TreeCache is corrupted and cannot be used"
+            )
+
+        self._mark_corrupted()
+        
+        token = self._new_token()
+        this_path = Path(self.storage_dir, f"{token}_this.mpmtrvp")
+        nxt_path = Path(self.storage_dir, f"{token}_nxt.mpmtrvp")
+
+        try:
+            node.this_share.save(str(this_path), aux_packbuf)
+            node.nxt_share.save(str(nxt_path),aux_packbuf)
+
+        except Exception:
+            try:
+                this_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+            try:
+                nxt_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+            raise
+
+        if self.leaf_num == 0:
+            self.leaf_num += 1
+            self.phi_r[self.leaf_num] = token
+            self.phi_f[token] = self.leaf_num
+        else:
+            lc_id = self.leaf_num * 2         
+            rc_id = lc_id + 1
+            ori_root_token = self.phi_r[self.leaf_num]
+            self.phi_r[rc_id] = token
+            self.phi_f[token] = rc_id
+            new_root_token = self._new_token()
+            self.phi_r[self.leaf_num] = new_root_token
+            self.phi_f[new_root_token] = self.leaf_num
+            self.phi_r[lc_id] = ori_root_token
+            self.phi_f[ori_root_token] = lc_id
+            self.leaf_num += 1
+
+        self._mark_valid()
+
+        return token
+    
+    
+    def update(
+        self, *,
+        token,
+        new_node,
+        aux_packbuf
+    ):
+        if self.corrupted:
+            raise RuntimeError(
+                "TreeCache is corrupted and cannot be used"
+            )
+        
+        self._mark_corrupted()
+        node_id = self.phi_f.get(token)
+
+        if node_id is None:
+            self._mark_valid()
+            raise KeyError(f"Unknown token: {token!r}")
+
+        if node_id < self.leaf_num:
+            self._mark_valid()
+            raise ValueError(f"Token {token!r} is an internal node")
+
+        this_path = os.path.join(self.storage_dir, f"{token}_this.mpmtrvp")
+        nxt_path = os.path.join(self.storage_dir, f"{token}_nxt.mpmtrvp")
+        new_node.this_share.save(this_path, aux_packbuf)
+        new_node.nxt_share.save(nxt_path, aux_packbuf)
+        self._mark_valid()
+
+
+    def remove(            
+        self, *,
+        del_token
+    ):
+        if self.corrupted:
+            raise RuntimeError(
+                "TreeCache is corrupted and cannot be used"
+            )
+
+        self._mark_corrupted()
+        del_id = self.phi_f.get(del_token)
+
+        if del_id is None:
+            self._mark_valid()
+            return
+        
+        old_leaf_num = self.leaf_num
+
+        if del_id < old_leaf_num:
+            self._mark_valid()
+            raise ValueError(
+                f"Token {del_token!r} is an internal node"
+            )
+
+        if old_leaf_num == 1:
+            del self.phi_f[del_token]
+            del self.phi_r[1]
+
+            self.leaf_num = 0
+        else:
+            collapse_id = old_leaf_num - 1
+            left_id = collapse_id * 2
+            right_id = left_id + 1
+
+            internal_token = self.phi_r[collapse_id]
+            left_token = self.phi_r[left_id]
+            right_token = self.phi_r[right_id]
+
+            if del_id == left_id:
+                promoted_token = right_token
+
+            elif del_id == right_id:
+                promoted_token = left_token
+
+            else:
+                self.phi_r[del_id] = right_token
+                self.phi_f[right_token] = del_id
+                promoted_token = left_token
+
+            self.phi_r[collapse_id] = promoted_token
+            self.phi_f[promoted_token] = collapse_id
+
+            del self.phi_r[left_id]
+            del self.phi_r[right_id]
+            del self.phi_f[internal_token]
+            del self.phi_f[del_token]
+            self.leaf_num = old_leaf_num - 1
+
+        this_path = Path(self.storage_dir, f"{del_token}_this.mpmtrvp")
+        nxt_path = Path(self.storage_dir, f"{del_token}_nxt.mpmtrvp")
+
+        this_path.unlink(missing_ok=True)
+        nxt_path.unlink(missing_ok=True)
+
+        self._mark_valid()
