@@ -114,6 +114,28 @@ template <ShrRep3Pid PID, uint64_t ELL> struct Rss3T
         aby3_->recvShare(sv);
     }
 
+    // ——— reshare  ———
+
+    ShareScalar reshare_scalar(uint8_t val)
+    {
+        return aby3_->reshare(val);
+    }
+
+    void reshare_vec(const RvType& vec, ShareVecType& sv)
+    {
+        if (&vec == &sv.thisShare)
+        {
+            throw std::invalid_argument("reshare_vec: vec must not alias sv.thisShare");
+        }
+        if (sv.size() == 0)
+        {
+            throw std::invalid_argument(
+                "reshare_vec: ShareVec must be pre-allocated with non-zero size"
+            );
+        }
+        aby3_->reshare(vec, sv);
+    }
+
     // ——— byte counters ———
     uint64_t bytes_sent()     const { return aby3_->bytes_sent(); }
     uint64_t bytes_recv()     const { return aby3_->bytes_recv(); }
@@ -434,6 +456,18 @@ template <ShrRep3Pid PID, uint64_t ELL> static void bind_rss3_instance(nb::modul
         [](T& self, typename T::ShareVecType& sv, math::RvectorPack&) { self.recv_share_vec(sv); },
         nb::call_guard<nb::gil_scoped_release>(),
         "sv"_a, "auxBuf"_a, "Receive a vector share via reshare → writes into sv; auxBuf is scratch space"
+    );
+
+    // ——— reshare ———
+    cls.def("reshare_scalar", &T::reshare_scalar, "val"_a,
+            "Reshare an existing additive scalar share into RSS3 form → (thisShare, nxtShare)");
+    cls.def(
+        "reshare_vector",
+        [](T& self, const typename T::RvType& vec, typename T::ShareVecType& sv,
+           math::RvectorPack&) { self.reshare_vec(vec, sv); },
+        nb::call_guard<nb::gil_scoped_release>(),
+        "vec"_a, "sv"_a, "auxBuf"_a,
+        "Reshare an existing additive vector share into RSS3 form → writes into sv; auxBuf is scratch space"
     );
 
     // ——— send_data / recv_data — scalar + byte array (no length prefix) ———

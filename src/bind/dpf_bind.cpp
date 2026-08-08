@@ -54,7 +54,7 @@ template <uint64_t ELL_IN, uint64_t ELL_OUT> struct DpfDealerT
 
     ~DpfDealerT() = default;
 
-    static std::pair<std::string, std::string> gen(uint32_t alpha, uint8_t beta)
+    std::pair<std::string, std::string> gen(uint32_t alpha, uint8_t beta) const
     {
         auto [k0, k1] = DealerType::gen(alpha, beta);
         return {nlohmann::json(k0).dump(), nlohmann::json(k1).dump()};
@@ -96,7 +96,7 @@ template <uint64_t EI, uint64_t EO> static void bind_dpf_dealer(nb::module_& m)
             "  eval0_channel  — Channel to Evaluator 0\n"
             "  eval1_channel  — Channel to Evaluator 1"
         )
-        .def_static("gen", &DpfDealerT<EI, EO>::gen, "alpha"_a, "beta"_a,
+        .def("gen", &DpfDealerT<EI, EO>::gen, "alpha"_a, "beta"_a,
              "Generate DPF key pair → (key0_json, key1_json)")
         .def("send_key", &DpfDealerT<EI, EO>::sendKey, "key_json"_a, "party"_a,
              "Send a key to evaluator (party=0 or 1)")
@@ -137,15 +137,15 @@ template <uint64_t ELL_IN, uint64_t ELL_OUT, int PARTY> struct DpfEvaluatorT
         return nlohmann::json(key).dump();
     }
 
-    static void eval(const std::string& key_json, nb::object buf_obj, int cores)
+    void eval(const std::string& key_json, nb::object buf_obj, int cores) const
     {
         KeyType key = nlohmann::json::parse(key_json).get<KeyType>();
         auto& buf = nb::cast<bind::RVECTOR<ELL_OUT>&>(buf_obj);
         do_eval(key, buf, cores);
     }
 
-    static void eval_range(const std::string& key_json, nb::object buf_obj,
-                           uint64_t bg, uint64_t ed, int cores)
+    void eval_range(const std::string& key_json, nb::object buf_obj,
+                           uint64_t bg, uint64_t ed, int cores) const
     {
         KeyType key = nlohmann::json::parse(key_json).get<KeyType>();
         auto& buf = nb::cast<bind::RVECTOR<ELL_OUT>&>(buf_obj);
@@ -212,10 +212,10 @@ template <uint64_t EI, uint64_t EO, int P> static void bind_dpf_evaluator(nb::mo
         )
         .def("recv_key", &DpfEvaluatorT<EI, EO, P>::recvKey,
              "Receive DPF key from the Dealer → JSON string")
-        .def_static("eval", &DpfEvaluatorT<EI, EO, P>::eval,
+        .def("eval", &DpfEvaluatorT<EI, EO, P>::eval,
              "key_json"_a, "buf"_a.noconvert(), "cores"_a = 1,
              "Evaluate from a JSON key string (no network needed)")
-        .def_static("eval_range",
+        .def("eval_range",
              &DpfEvaluatorT<EI, EO, P>::eval_range,
              "key_json"_a, "buf"_a.noconvert(), "bg"_a, "ed"_a, "cores"_a = 1,
              "Range evaluation: compute only leaves in the specified range. "

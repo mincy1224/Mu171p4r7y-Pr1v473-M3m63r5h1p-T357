@@ -205,6 +205,38 @@ public:
                       oVec.nxtShare.bytesSize());
     }
 
+    /// Re-share an existing additive-share component into RSS3 form.
+    /// The caller already holds its additive share in *vec*;
+    /// this method sends it around the ring and fills *oVec*.
+    /// @pre  &vec != &oVec.thisShare
+    void reshare(const RVECTOR<ELL>& vec, ShareVector<ELL>& oVec)
+    {
+        if (&vec == &oVec.thisShare)
+        {
+            throw std::invalid_argument("reshare: vec must not alias oVec.thisShare");
+        }
+
+        // Use caller-provided additive share as thisShare
+        oVec.thisShare = vec;
+
+        // Reshare: send thisShare to prev, recv nxtShare from next
+        _reshare_ring(oVec.thisShare.data(), oVec.nxtShare.data(),
+                      oVec.nxtShare.bytesSize());
+    }
+
+    /// Scalar variant: reshare a single byte into RSS3 form.
+    ShareScalar reshare(uint8_t val)
+    {
+        ShareScalar s;
+        s.thisShare = val;
+
+        nioToPrev_->send_data(&s.thisShare, 1);
+        nioToPrev_->flush();
+        nioToNext_->recv_data(&s.nxtShare, 1);
+
+        return s;
+    }
+
     // ——— send / recv (plain data transfer) ———
 
     /// Send a scalar to party TO.
