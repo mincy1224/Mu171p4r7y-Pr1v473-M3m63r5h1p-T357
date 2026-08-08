@@ -59,7 +59,7 @@ def bf_param(set_size: int, fpr_mantissa: float, fpr_exponent: int):
     bf_size = round(bf_size_raw)
     bf_size_log2up = math.ceil(math.log2(bf_size))
     hf_num = round((bf_size_raw / set_size) * ln2)
-    hf_num_log2up = math.ceil(math.log2(hf_num))
+    hf_num_log2up = math.floor(math.log2(hf_num)) + 1
 
     return bf_size, bf_size_log2up, hf_num, hf_num_log2up
 
