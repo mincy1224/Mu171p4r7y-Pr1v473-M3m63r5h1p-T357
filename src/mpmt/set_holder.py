@@ -30,7 +30,11 @@ class SetHolder:
         Rv = mpmt.Rvector(ell=1)
         bf = Rv(self._bf_size)
         bf.fill(0)
-        batch_size = max(2 ** 20, self._bf_size // 128)
+        batch_size = min(
+            2 ** 20,
+            max(2 ** 18, self._bf_size // 128),
+        )
+
         batch_cap = batch_size * self._hf_num
         batch_idx = array("Q", [0]) * batch_cap
         pos = 0
