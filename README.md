@@ -15,7 +15,7 @@ multi-party set data confidential.
 ```
   ┌─ Python ─────────────────────────────────────────────┐
   │  ProtocolHandler  QueryServer                        │
-  │  MpmtServerLeader MpmtSetHolder  TreeCache           │
+  │  MpmtServerLeader SetHolder  TreeCache           │
   ├─ C++ bindings ───────────────────────────────────────┤
   │  nanobind 2.13  ·  shared_ptr IOChannel registry     │
   │  GIL-safe I/O   ·  factory dispatch                  │
