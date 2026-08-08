@@ -26,7 +26,7 @@ class SetHolder:
         self, *,
         set: list[bytes],
         hash_seed_list: list[bytes],
-    ):
+    ):        
         Rv = mpmt.Rvector(ell=1)
         bf = Rv(self._bf_size)
         bf.fill(0)
@@ -57,11 +57,18 @@ class SetHolder:
         ch_peer0: mpmt.channels.Channel,
         ch_peer1: mpmt.channels.Channel
     ) -> None:
+        if len(hash_seed_list) != self._hf_num:
+            raise ValueError(
+                f"Hash function count mismatch: "
+                f"expected {self._hf_num}, "
+                f"got {len(hash_seed_list)}"
+            )
+        
         rep3_inst = mpmt.ShrRep3(ell=1, party=0)(
             ch_peer1,  # prev
             ch_peer0,  # nxt
         )
-        
+
         rt_inst = mpmt.RingTransport(ell=1)(ch_steward)
         
         bf = self._genbf_plain(
