@@ -1,13 +1,13 @@
 """Rvector + RvectorPack standalone — factory, properties, save/load, scalar ops."""
 import sys, os, random, tempfile
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 import mpmt
 
 PASS = FAIL = 0
 def check(name, cond, detail=""):
     global PASS, FAIL
     if cond: PASS += 1
-    else: FAIL += 1; print(f"  ❌ {name}  {detail}")
+    else: FAIL += 1; print(f"  FAIL {name}  {detail}")
 
 def packed_bytes(ell, n):
     """RvectorPack._bytesFor result — packed buffer size."""

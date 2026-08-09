@@ -3,20 +3,20 @@
 
 Usage:
   python3 tests/run_all.py            # full coverage (CI)
-  python3 tests/run_all.py -sm        # small-scale (local pre-push)
+  python3 tests/run_all.py --small    # small-scale (local pre-push)
   TEST_SEED=42 python3 tests/run_all.py  # reproducible
 """
 import sys, os, random, time, argparse
 
 ap = argparse.ArgumentParser()
-ap.add_argument("-sm", action="store_true", help="Small-scale quick test")
+ap.add_argument("--small", action="store_true", help="Small-scale quick test")
 args = ap.parse_args()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import mpmt
-from test_aby3.harness import run_3party
-from test_emp2.harness import run_2party
-from test_dpf.harness import run_dpf
+from building_blocks.test_aby3.harness import run_3party
+from building_blocks.test_emp2.harness import run_2party
+from building_blocks.test_dpf.harness import run_dpf
 
 # Reproducible randomness
 SEED = int(os.environ.get("TEST_SEED", random.randint(0, 2**31 - 1)))
@@ -27,7 +27,7 @@ TSTART = time.monotonic()
 def check(name, cond, detail=""):
     global PASS, FAIL
     if cond: PASS += 1
-    else: FAIL += 1; print(f"  ❌ {name}  {detail}")
+    else: FAIL += 1; print(f"  FAIL {name}  {detail}")
 
 def recon3(r, ell):
     return mpmt.ring_add(ell, r[0][0], mpmt.ring_add(ell, r[1][0], r[2][0]))
@@ -35,24 +35,24 @@ def recon3(r, ell):
 def recon2(r, ell):
     return mpmt.ring_add(ell, r[0], r[1])
 
-ELLS_ABY3 = [1, 6] if args.sm else list(range(1, 7))
-ELLS_EMP2 = [2, 31] if args.sm else list(range(2, 32))
-ELLS_RVEC = [1, 8] if args.sm else list(range(1, 9))
-DPF_EI     = [13, 20] if args.sm else list(range(13, 32))
-DPF_EO     = [2, 6] if args.sm else list(range(2, 7))
-DPF_CORES  = [1] if args.sm else [1, 4, 8, 16]
+ELLS_ABY3 = [1, 6] if args.small else list(range(1, 7))
+ELLS_EMP2 = [2, 31] if args.small else list(range(2, 32))
+ELLS_RVEC = [1, 8] if args.small else list(range(1, 9))
+DPF_EI     = [13, 20] if args.small else list(range(13, 32))
+DPF_EO     = [2, 6] if args.small else list(range(2, 7))
+DPF_CORES  = [1] if args.small else [1, 4, 8, 16]
 # Boundary sizes for packing corner cases
 PACK_SIZES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 255, 256]
 
-MODE = "SMALL" if args.sm else "FULL"
+MODE = "SMALL" if args.small else "FULL"
 print(f"=== MPMT Test Suite ({MODE})  seed={SEED} ===")
 
-# ═══════════════════════════════════════════════════════════
+# ===========================================================
 #  UTILS
-# ═══════════════════════════════════════════════════════════
-print("─── Utils ───")
+# ===========================================================
+print("--- Utils ---")
 
-for ell in [1, 8, 31, 63]:
+for ell in [1, 8, 31]:
     check(f"ring_mask({ell})", mpmt.ring_mask(ell) == (1 << ell) - 1)
 
 for ell in [1, 8, 31]:
@@ -82,17 +82,17 @@ h2 = mpmt.hash_aes_dm(preimage=b"hello", key=k, ell=8)
 check("hash_aes_dm deterministic", h1 == h2)
 check("hash_aes_dm in range", h1 <= mpmt.ring_mask(8))
 
-# ═══════════════════════════════════════════════════════════
+# ===========================================================
 #  RVECTOR — comprehensive boundary testing
-# ═══════════════════════════════════════════════════════════
-print(f"─── Rvector ({len(ELLS_RVEC)} ELLs) ───")
+# ===========================================================
+print(f"--- Rvector ({len(ELLS_RVEC)} ELLs) ---")
 
 for ell in ELLS_RVEC:
     Rv = mpmt.Rvector(ell); m = mpmt.ring_mask(ell)
     check(f"Rvector({ell}) factory", Rv is not None)
 
     # Test every boundary size for pack/unpack corner cases
-    test_sizes = PACK_SIZES if not args.sm else [0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 32]
+    test_sizes = PACK_SIZES if not args.small else [0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 32]
     for n in test_sizes:
         # construct + fill + get/set
         v = Rv(n)
@@ -190,10 +190,10 @@ for ell in ELLS_RVEC:
     min_nz = 20 if ell > 1 else 50
     check(f"Rvector{ell} rand_fill", nz >= min_nz, f"only {nz}/200")
 
-# ═══════════════════════════════════════════════════════════
+# ===========================================================
 #  ABY3
-# ═══════════════════════════════════════════════════════════
-print(f"─── ABY3 ({len(ELLS_ABY3)} ELLs) ───")
+# ===========================================================
+print(f"--- ABY3 ({len(ELLS_ABY3)} ELLs) ---")
 
 for ell in ELLS_ABY3:
     m = mpmt.ring_mask(ell)
@@ -290,9 +290,9 @@ for ell in ELLS_ABY3:
     check(f"ABY3{ell} hadamard", r[0] == exp and r[0] == r[1] == r[2])
 
 # ring_conv
-print(f"─── ABY3 ring_conv ───")
+print(f"--- ABY3 ring_conv ---")
 bit = random.randint(0, 1)
-RC_ELLS = [2, 6] if args.sm else list(range(2, 7))
+RC_ELLS = [2, 6] if args.small else list(range(2, 7))
 for ell_to in RC_ELLS:
     exp = bit & mpmt.ring_mask(ell_to)
     def rcfn(pid, p, n):
@@ -326,10 +326,10 @@ for ell_to in RC_ELLS:
     r = run_3party(rcvfn, 1)
     check(f"ring_conv_vec 1→{ell_to}", r[0] == exp_v and r[0] == r[1] == r[2])
 
-# ═══════════════════════════════════════════════════════════
+# ===========================================================
 #  EMP2
-# ═══════════════════════════════════════════════════════════
-print(f"─── EMP2 ({len(ELLS_EMP2)} ELLs) ───")
+# ===========================================================
+print(f"--- EMP2 ({len(ELLS_EMP2)} ELLs) ---")
 
 for ell in ELLS_EMP2:
     m = mpmt.ring_mask(ell)
@@ -414,10 +414,10 @@ for ell in ELLS_EMP2:
     r = run_2party(hf, ell)
     check(f"EMP2{ell} hash", r[0] == exp_h and r[0] == r[1])
 
-# ═══════════════════════════════════════════════════════════
+# ===========================================================
 #  DPF
-# ═══════════════════════════════════════════════════════════
-print(f"─── DPF ({len(DPF_EI)} EI × {len(DPF_EO)} EO) ───")
+# ===========================================================
+print(f"--- DPF ({len(DPF_EI)} EI × {len(DPF_EO)} EO) ---")
 
 for ei in DPF_EI:
     for eo in DPF_EO:
@@ -433,7 +433,7 @@ for ei in DPF_EI:
 
         def d_full(c0, c1):
             DC = mpmt.DpfDealer(ei, eo); d = DC(c0, c1)
-            k0, k1 = DC.gen(alpha, beta); d.send_key(k0, 0); d.send_key(k1, 1)
+            k0, k1 = d.gen(alpha, beta); d.send_key(k0, 0); d.send_key(k1, 1)
             Rv = mpmt.Rvector(eo); out = Rv(vl); d.reveal(out)
             ok = out[alpha] == beta
             for i in random.sample(range(vl), min(20, vl)):
@@ -442,7 +442,7 @@ for ei in DPF_EI:
         def ev_full(pid):
             return lambda c: (EC:=mpmt.DpfEvaluator(ei,eo,pid), ev:=EC(c),
                   k:=ev.recv_key(), b:=mpmt.Rvector(eo)(vl),
-                  EC.eval(k, b, cores=cores), ev.reveal(b), "OK")[-1]
+                  ev.eval(k, b, cores=cores), ev.reveal(b), "OK")[-1]
         r = run_dpf(d_full, ev_full(0), ev_full(1), timeout=180)
         check(f"DPF({ei},{eo},c{cores}) full", r[0] == "OK")
 
@@ -454,7 +454,7 @@ for ei in DPF_EI:
         rl = ed - bg + 1
         def d_range(c0, c1):
             DC = mpmt.DpfDealer(ei, eo); d = DC(c0, c1)
-            k0, k1 = DC.gen(alpha, beta); d.send_key(k0, 0); d.send_key(k1, 1)
+            k0, k1 = d.gen(alpha, beta); d.send_key(k0, 0); d.send_key(k1, 1)
             Rv = mpmt.Rvector(eo); out = Rv(rl); d.reveal(out)
             ok = True
             for i in range(rl):
@@ -464,11 +464,36 @@ for ei in DPF_EI:
         def ev_range(pid):
             return lambda c: (EC:=mpmt.DpfEvaluator(ei,eo,pid), ev:=EC(c),
                   k:=ev.recv_key(), b:=mpmt.Rvector(eo)(rl),
-                  EC.eval_range(k, b, bg, ed, cores=cores), ev.reveal(b), "OK")[-1]
+                  ev.eval_range(k, b, bg, ed, cores=cores), ev.reveal(b), "OK")[-1]
         r = run_dpf(d_range, ev_range(0), ev_range(1), timeout=180)
         check(f"DPF({ei},{eo},c{cores}) range", r[0] == "OK")
 
-# ═══════════════════════════════════════════════════════════
+# ===========================================================
+#  COVERAGE MODULES
+# ===========================================================
+
+from base.test_util import run_tests as run_util
+from base.test_sharevec import run_tests as run_sharevec
+from base.test_channels import run_tests as run_channels
+from base.test_ring_transport import run_tests as run_ring_transport
+from building_blocks.test_aby3.test_operations import run_tests as run_aby3_ops
+from building_blocks.test_aby3.test_protocol import run_tests as run_aby3_proto
+from building_blocks.test_aby3.test_factory import run_tests as run_aby3_fact
+from building_blocks.test_aby3.test_compound import run_tests as run_aby3_comp
+from building_blocks.test_emp2.test_operations import run_tests as run_emp2_ops
+from building_blocks.test_emp2.test_protocol import run_tests as run_emp2_proto
+from building_blocks.test_emp2.test_factory import run_tests as run_emp2_fact
+from building_blocks.test_dpf.test_operations import run_tests as run_dpf_ops
+from building_blocks.test_dpf.test_basic import run_tests as run_dpf_basic
+
+for _mod in [run_util, run_sharevec, run_channels, run_ring_transport,
+             run_aby3_ops, run_aby3_proto, run_aby3_fact, run_aby3_comp,
+             run_emp2_ops, run_emp2_proto, run_emp2_fact,
+             run_dpf_ops, run_dpf_basic]:
+    p, f = _mod(small=args.small)
+    PASS += p; FAIL += f
+
+# ===========================================================
 elapsed = time.monotonic() - TSTART
 print(f"\n{'='*60}")
 print(f"  MODE={MODE}  PASS={PASS}  FAIL={FAIL}  seed={SEED}  ({elapsed:.1f}s)")

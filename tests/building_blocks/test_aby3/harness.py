@@ -3,6 +3,7 @@ import multiprocessing as mp
 import socket, time, traceback, sys, os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 import mpmt
 
 
@@ -85,8 +86,8 @@ def run_3party(party_fn, ell, timeout=60):
 
 def check(name, cond):
     if cond:
-        print(f"  ✅ {name}")
+        print(f"  OK {name}")
         return True
     else:
-        print(f"  ❌ {name}")
+        print(f"  FAIL {name}")
         return False
