@@ -106,47 +106,85 @@ void bind_util(nb::module_& m)
     m.def(
         "ring_mask",
         [](uint64_t ell) -> uint64_t {
-            if (ell >= 64) return ~UINT64_C(0);
+            if (ell < 1 || ell > 31)
+                throw std::invalid_argument(
+                    "ring_mask: ell must be in [1, 31], got " + std::to_string(ell));
             return (UINT64_C(1) << ell) - 1;
         },
         "ell"_a,
-        "Return the ring mask for Z_{2^ELL}."
+        "Return the ring mask for Z_{2^ELL}, 1 ≤ ell ≤ 31."
     );
 
     m.def(
         "ring_add",
         [](uint64_t ell, uint64_t a, uint64_t b) -> uint64_t {
-            uint64_t mask = (ell >= 64) ? ~UINT64_C(0) : ((UINT64_C(1) << ell) - 1);
+            if (ell < 1 || ell > 31)
+                throw std::invalid_argument(
+                    "ring_add: ell must be in [1, 31], got " + std::to_string(ell));
+            uint64_t mask = (UINT64_C(1) << ell) - 1;
+            if (a > mask)
+                throw std::invalid_argument(
+                    "ring_add: a=" + std::to_string(a)
+                    + " out of range for Z_{2^" + std::to_string(ell) + "}");
+            if (b > mask)
+                throw std::invalid_argument(
+                    "ring_add: b=" + std::to_string(b)
+                    + " out of range for Z_{2^" + std::to_string(ell) + "}");
             return (a + b) & mask;
         },
         "ell"_a, "a"_a, "b"_a,
-        "Ring addition: (a + b) mod 2^ELL."
+        "Ring addition: (a + b) mod 2^ELL.  a, b must be in Z_{2^ELL}."
     );
 
     m.def(
         "ring_sub",
         [](uint64_t ell, uint64_t a, uint64_t b) -> uint64_t {
-            uint64_t mask = (ell >= 64) ? ~UINT64_C(0) : ((UINT64_C(1) << ell) - 1);
+            if (ell < 1 || ell > 31)
+                throw std::invalid_argument(
+                    "ring_sub: ell must be in [1, 31], got " + std::to_string(ell));
+            uint64_t mask = (UINT64_C(1) << ell) - 1;
+            if (a > mask)
+                throw std::invalid_argument(
+                    "ring_sub: a=" + std::to_string(a)
+                    + " out of range for Z_{2^" + std::to_string(ell) + "}");
+            if (b > mask)
+                throw std::invalid_argument(
+                    "ring_sub: b=" + std::to_string(b)
+                    + " out of range for Z_{2^" + std::to_string(ell) + "}");
             return (a - b) & mask;
         },
         "ell"_a, "a"_a, "b"_a,
-        "Ring subtraction: (a - b) mod 2^ELL."
+        "Ring subtraction: (a - b) mod 2^ELL.  a, b must be in Z_{2^ELL}."
     );
 
     m.def(
         "ring_mul",
         [](uint64_t ell, uint64_t a, uint64_t b) -> uint64_t {
-            uint64_t mask = (ell >= 64) ? ~UINT64_C(0) : ((UINT64_C(1) << ell) - 1);
+            if (ell < 1 || ell > 31)
+                throw std::invalid_argument(
+                    "ring_mul: ell must be in [1, 31], got " + std::to_string(ell));
+            uint64_t mask = (UINT64_C(1) << ell) - 1;
+            if (a > mask)
+                throw std::invalid_argument(
+                    "ring_mul: a=" + std::to_string(a)
+                    + " out of range for Z_{2^" + std::to_string(ell) + "}");
+            if (b > mask)
+                throw std::invalid_argument(
+                    "ring_mul: b=" + std::to_string(b)
+                    + " out of range for Z_{2^" + std::to_string(ell) + "}");
             return (a * b) & mask;
         },
         "ell"_a, "a"_a, "b"_a,
-        "Ring multiplication: (a * b) mod 2^ELL."
+        "Ring multiplication: (a * b) mod 2^ELL.  a, b must be in Z_{2^ELL}."
     );
 
     m.def(
         "ring_mod",
         [](uint64_t ell, uint64_t val, uint64_t mod) -> uint64_t {
-            uint64_t mask = (ell >= 64) ? ~UINT64_C(0) : ((UINT64_C(1) << ell) - 1);
+            if (ell < 1 || ell > 31)
+                throw std::invalid_argument(
+                    "ring_mod: ell must be in [1, 31], got " + std::to_string(ell));
+            uint64_t mask = (UINT64_C(1) << ell) - 1;
             if (val > mask)
                 throw std::invalid_argument(
                     "ring_mod: val out of range for Z_{2^" + std::to_string(ell) + "}");
