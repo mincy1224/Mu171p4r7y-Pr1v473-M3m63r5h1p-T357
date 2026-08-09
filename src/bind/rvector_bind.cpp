@@ -236,105 +236,6 @@ template <uint64_t ELL> static void bind_rvector(nb::module_& m, const char* nam
         );
 }
 
-// ———  RingTransport  ———  ring element send/recv over a Channel                           ———
-//                                                                                             —
-//   ELL 1–8 :  vector-capable   send_vector / recv_vector  (packed Rvector)                   —
-//   ELL 9–31:  scalar-only      send_scalar / recv_scalar  (raw ring element)                 —
-// —————————————————————————————————————————————————————————————————————————————————————————————
-
-template <uint64_t ELL> struct RingVectorTransport
-{
-    static_assert(ELL >= 1 && ELL <= 8, "ELL 1-8 for vector transport");
-    std::shared_ptr<emp::IOChannel> io_;
-    RingVectorTransport(std::shared_ptr<emp::IOChannel> io) : io_(std::move(io)) {}
-
-    void send_vector(const math::Rvector<ELL>& vec, math::RvectorPack& auxBuf)
-    {
-        packRvec(vec, auxBuf);
-        io_->send_data(auxBuf.data(), auxBuf.size());
-        io_->flush();
-    }
-    void recv_vector(math::Rvector<ELL>& vec, math::RvectorPack& auxBuf)
-    {
-        io_->recv_data(auxBuf.data(), auxBuf.size());
-        unpackRvec(auxBuf, vec);
-    }
-};
-
-template <uint64_t ELL> struct RingScalarTransport
-{
-    static_assert(ELL >= 1 && ELL <= 63, "ELL 1-63 for scalar transport");
-    std::shared_ptr<emp::IOChannel> io_;
-    RingScalarTransport(std::shared_ptr<emp::IOChannel> io) : io_(std::move(io)) {}
-    static constexpr size_t BYTES = (ELL + 7) / 8;
-
-    void send_scalar(uint64_t val)
-    {
-        if constexpr (ELL < 64) {
-            uint64_t mask = (UINT64_C(1) << ELL) - 1;
-            if (val > mask)
-                throw std::invalid_argument(
-                    "send_scalar(" + std::to_string(val)
-                    + "): value out of range for Z_{2^" + std::to_string(ELL) + "}");
-        }
-        uint8_t buf[BYTES];
-        for (size_t i = 0; i < BYTES; ++i) buf[i] = static_cast<uint8_t>(val >> (8 * i));
-        io_->send_data(buf, BYTES);
-        io_->flush();
-    }
-    uint64_t recv_scalar()
-    {
-        uint8_t buf[BYTES] = {};
-        io_->recv_data(buf, BYTES);
-        uint64_t val = 0;
-        for (size_t i = 0; i < BYTES; ++i) val |= static_cast<uint64_t>(buf[i]) << (8 * i);
-        if constexpr (ELL < 64) { val &= (UINT64_C(1) << ELL) - 1; }
-        return val;
-    }
-};
-
-static constexpr int RING_TRANSPORT_MAX = 31;
-
-template <uint64_t ELL> static void bind_ring_transport(nb::module_& m, const char* name)
-{
-    using namespace nb::literals;
-
-    if constexpr (ELL <= 8)
-    {
-        using T = RingVectorTransport<ELL>;
-        nb::class_<T>(m, name)
-            .def("__init__",
-                 [](T* self, nb::object channel) {
-                     auto io = bind::netio_acquire(
-                         nb::cast<uintptr_t>(channel.attr("acquire")()));
-                     new (self) T(std::move(io));
-                 },
-                 "channel"_a, "RingTransport(ell)(channel) — vector send/recv.")
-            .def_prop_ro("ell", [](const T&) { return ELL; })
-            .def("send_vector", &T::send_vector, nb::call_guard<nb::gil_scoped_release>(),
-                 "vec"_a, "auxBuf"_a, "Pack vec into auxBuf and send over the channel.")
-            .def("recv_vector", &T::recv_vector, nb::call_guard<nb::gil_scoped_release>(),
-                 "vec"_a, "auxBuf"_a, "Receive into auxBuf and unpack into vec.");
-    }
-    else
-    {
-        using T = RingScalarTransport<ELL>;
-        nb::class_<T>(m, name)
-            .def("__init__",
-                 [](T* self, nb::object channel) {
-                     auto io = bind::netio_acquire(
-                         nb::cast<uintptr_t>(channel.attr("acquire")()));
-                     new (self) T(std::move(io));
-                 },
-                 "channel"_a, "RingTransport(ell)(channel) — scalar send/recv.")
-            .def_prop_ro("ell", [](const T&) { return ELL; })
-            .def("send_scalar", &T::send_scalar, nb::call_guard<nb::gil_scoped_release>(),
-                 "val"_a, "Send a scalar ring element (ELL bits).")
-            .def("recv_scalar", &T::recv_scalar, nb::call_guard<nb::gil_scoped_release>(),
-                 "Receive a scalar ring element (ELL bits).");
-    }
-}
-
 //  Module
 NB_MODULE(_mpmt, m)
 {
@@ -404,64 +305,39 @@ NB_MODULE(_mpmt, m)
     //  rvector_pack / rvector_unpack — module-level (not class-bound)
     m.def(
         "rvector_pack",
-        [](nb::object src, math::RvectorPack& auxBuf) {
+        [](nb::object src, math::RvectorPack& aux_buf) {
             bool found = false;
             bind::for_range<bind::RVECTOR_ELL_MIN, bind::RVECTOR_ELL_MAX>(
                 [&]<uint64_t ELL>() {
                     if (found) return;
                     math::Rvector<ELL>* v = nullptr;
-                    if (nb::try_cast(src, v)) { packRvec(*v, auxBuf); found = true; }
+                    if (nb::try_cast(src, v)) { packRvec(*v, aux_buf); found = true; }
                 });
             if (!found)
                 throw nb::type_error("rvector_pack: src must be an Rvector instance");
         },
-        "src"_a, "auxBuf"_a,
+        "src"_a, "aux_buf"_a,
         "Pack an Rvector into a pre-allocated RvectorPack buffer."
     );
     m.def(
         "rvector_unpack",
-        [](const math::RvectorPack& auxBuf, nb::object dst) {
+        [](const math::RvectorPack& aux_buf, nb::object dst) {
             bool found = false;
             bind::for_range<bind::RVECTOR_ELL_MIN, bind::RVECTOR_ELL_MAX>(
                 [&]<uint64_t ELL>() {
                     if (found) return;
                     math::Rvector<ELL>* v = nullptr;
-                    if (nb::try_cast(dst, v)) { unpackRvec(auxBuf, *v); found = true; }
+                    if (nb::try_cast(dst, v)) { unpackRvec(aux_buf, *v); found = true; }
                 });
             if (!found)
                 throw nb::type_error("rvector_unpack: dst must be an Rvector instance");
         },
-        "auxBuf"_a, "dst"_a,
+        "aux_buf"_a, "dst"_a,
         "Unpack an RvectorPack buffer into a pre-allocated Rvector."
     );
 
-    //  RingTransportEll1 .. RingTransportEll31  —  per-ELL classes
-    static nb::object ring_transport_types[RING_TRANSPORT_MAX + 1];
-
-    bind::for_range<1, RING_TRANSPORT_MAX>(
-        [&]<uint64_t ELL>()
-        {
-            char name[64];
-            std::snprintf(name, sizeof(name), "RingTransportEll%lu", ELL);
-            bind_ring_transport<ELL>(m, name);
-            ring_transport_types[ELL] = m.attr(name);
-        }
-    );
-
-    //  Factory: RingTransport(ell) → class; class(channel) → instance
-    m.def(
-        "RingTransport",
-        [](uint64_t ell) -> nb::object
-        {
-            if (ell < 1 || ell > RING_TRANSPORT_MAX)
-                throw std::invalid_argument("ell out of range [1, 31]");
-            return ring_transport_types[ell];
-        },
-        "ell"_a,
-        "RingTransport(ell)(channel) — ring element transport over a Channel.\n"
-        "  ELL 1–8  →  send_vector / recv_vector  (packed Rvector)\n"
-        "  ELL 9–31 →  send_scalar / recv_scalar  (raw ring element)"
-    );
+    void bind_transport(nb::module_&);
+    bind_transport(m);
 
     void bind_util(nb::module_&);
     bind_util(m);

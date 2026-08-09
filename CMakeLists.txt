@@ -56,6 +56,7 @@ find_package(nanobind REQUIRED)
 
 nanobind_add_module(_mpmt NB_DOMAIN mpmt NOMINSIZE
     src/bind/rvector_bind.cpp
+    src/bind/transport_bind.cpp
     src/bind/util_bind.cpp
     src/bind/dpf_bind.cpp
     src/bind/aby3_bind.cpp
