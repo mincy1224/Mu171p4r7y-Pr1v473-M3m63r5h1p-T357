@@ -49,18 +49,31 @@ class Channel:
         ch = Channel("127.0.0.1", 14000)   # connect to 127.0.0.1:14000
     """
 
-    def __init__(self, *args):
-        n = len(args)
-        if n == 1:
+    def __init__(self, *args, port=None, host=None):
+        # Resolve keyword vs positional — keyword wins if given
+        n_pos = len(args)
+        if port is not None or host is not None:
+            if n_pos > 0:
+                raise TypeError(
+                    "Channel() accepts positional or keyword args, not both"
+                )
+        elif n_pos == 1:
             port = args[0]
-            self._netio_ptr = _mpmt.NetIO_listen(port)
-        elif n == 2:
+        elif n_pos == 2:
             host, port = args
-            self._netio_ptr = _mpmt.NetIO_connect(host, port)
         else:
             raise TypeError(
                 "Channel(port) for server or Channel(host, port) for client"
             )
+
+        if host is not None:
+            if port is None:
+                raise TypeError("port is required with host")
+            self._netio_ptr = _mpmt.NetIO_connect(host, port)
+        else:
+            if port is None:
+                raise TypeError("port is required")
+            self._netio_ptr = _mpmt.NetIO_listen(port)
 
     def __del__(self):
         if hasattr(self, '_netio_ptr') and self._netio_ptr != 0:
