@@ -26,7 +26,7 @@ jobs:
             libsodium-dev nlohmann-json3-dev \
             libssl-dev python3-pip
 
-      # ── emp-tool ─────────────────────────────────────────────
+      # -- emp-tool ---------------------------------------------
       - name: Cache emp-tool
         id: cache-emp-tool
         uses: actions/cache@v4
@@ -38,7 +38,7 @@ jobs:
         if: steps.cache-emp-tool.outputs.cache-hit != 'true'
         run: .github/install-deps.sh emp-tool
 
-      # ── emp-ot ───────────────────────────────────────────────
+      # -- emp-ot -----------------------------------------------
       - name: Cache emp-ot
         id: cache-emp-ot
         uses: actions/cache@v4
@@ -50,7 +50,7 @@ jobs:
         if: steps.cache-emp-ot.outputs.cache-hit != 'true'
         run: .github/install-deps.sh emp-ot
 
-      # ── emp-sh2pc ────────────────────────────────────────────
+      # -- emp-sh2pc --------------------------------------------
       - name: Cache emp-sh2pc
         id: cache-emp-sh2pc
         uses: actions/cache@v4
@@ -62,16 +62,16 @@ jobs:
         if: steps.cache-emp-sh2pc.outputs.cache-hit != 'true'
         run: .github/install-deps.sh emp-sh2pc
 
-      # ── Python dependencies ──────────────────────────────────
+      # -- Python dependencies ----------------------------------
       - name: Install Python packages
         run: |
           pip install --upgrade pip
           pip install 'nanobind>=2.13' scikit-build-core cloudpickle
 
-      # ── Build mpmt ───────────────────────────────────────────
+      # -- Build mpmt -------------------------------------------
       - name: Build mpmt
         run: pip install -e . -v
 
-      # ── Tests ────────────────────────────────────────────────
+      # -- Tests ------------------------------------------------
       - name: Run all tests
         run: python3 tests/run_all.py
