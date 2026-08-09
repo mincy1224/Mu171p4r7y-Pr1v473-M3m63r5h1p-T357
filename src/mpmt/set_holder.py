@@ -83,15 +83,15 @@ class SetHolder:
         rep3_inst.share_vector(
             vec=bf,
             sv=self._sv_buf,
-            auxBuf=self._pack_buf
+            aux_buf=self._pack_buf
         )
 
         rt_inst.send_vector(
             vec=self._sv_buf.this_share,
-            auxBuf=self._pack_buf
+            aux_buf=self._pack_buf
         )
 
         rt_inst.send_vector(
             vec=self._sv_buf.nxt_share,
-            auxBuf=self._pack_buf
+            aux_buf=self._pack_buf
         )

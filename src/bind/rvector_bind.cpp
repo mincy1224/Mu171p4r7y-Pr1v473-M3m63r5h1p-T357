@@ -165,10 +165,10 @@ template <uint64_t ELL> static void bind_rvector(nb::module_& m, const char* nam
             }
         )
 
-        //  file I/O  (auxBuf = RvectorPack — caller-allocated buffer)
-        .def("save", &Rv::save, nb::call_guard<nb::gil_scoped_release>(), "path"_a, "auxBuf"_a,
+        //  file I/O  (aux_buf = RvectorPack — caller-allocated buffer)
+        .def("save", &Rv::save, nb::call_guard<nb::gil_scoped_release>(), "path"_a, "aux_buf"_a,
              "Save to file (compact format: [ELL, n, payload]), uses caller-provided buffer")
-        .def("load", &Rv::load, nb::call_guard<nb::gil_scoped_release>(), "path"_a, "auxBuf"_a,
+        .def("load", &Rv::load, nb::call_guard<nb::gil_scoped_release>(), "path"_a, "aux_buf"_a,
              "Load from file; checks that on-disk ELL and n match")
 
         //  static arithmetic  (vector-vector)

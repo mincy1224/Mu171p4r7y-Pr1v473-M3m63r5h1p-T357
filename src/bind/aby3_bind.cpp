@@ -446,7 +446,7 @@ template <ShrRep3Pid PID, uint64_t ELL> static void bind_rss3_instance(nb::modul
         [](T& self, const typename T::RvType& vec, typename T::ShareVecType& sv,
            math::RvectorPack&) { self.share_vec(vec, sv); },
         nb::call_guard<nb::gil_scoped_release>(),
-        "vec"_a, "sv"_a, "auxBuf"_a, "Share a vector → writes into sv; auxBuf is scratch space"
+        "vec"_a, "sv"_a, "aux_buf"_a, "Share a vector → writes into sv; aux_buf is scratch space"
     );
 
     // ——— recv_scalar_share ———
@@ -455,7 +455,7 @@ template <ShrRep3Pid PID, uint64_t ELL> static void bind_rss3_instance(nb::modul
         "recv_vector_share",
         [](T& self, typename T::ShareVecType& sv, math::RvectorPack&) { self.recv_share_vec(sv); },
         nb::call_guard<nb::gil_scoped_release>(),
-        "sv"_a, "auxBuf"_a, "Receive a vector share via reshare → writes into sv; auxBuf is scratch space"
+        "sv"_a, "aux_buf"_a, "Receive a vector share via reshare → writes into sv; aux_buf is scratch space"
     );
 
     // ——— reshare ———
@@ -466,8 +466,8 @@ template <ShrRep3Pid PID, uint64_t ELL> static void bind_rss3_instance(nb::modul
         [](T& self, const typename T::RvType& vec, typename T::ShareVecType& sv,
            math::RvectorPack&) { self.reshare_vec(vec, sv); },
         nb::call_guard<nb::gil_scoped_release>(),
-        "vec"_a, "sv"_a, "auxBuf"_a,
-        "Reshare an existing additive vector share into RSS3 form → writes into sv; auxBuf is scratch space"
+        "vec"_a, "sv"_a, "aux_buf"_a,
+        "Reshare an existing additive vector share into RSS3 form → writes into sv; aux_buf is scratch space"
     );
 
     // ——— send_data / recv_data — scalar + byte array (no length prefix) ———
@@ -511,9 +511,9 @@ template <ShrRep3Pid PID, uint64_t ELL> static void bind_rss3_instance(nb::modul
         nb::call_guard<nb::gil_scoped_release>(),
         "sv"_a,
         "out"_a,
-        "auxBuf"_a,
+        "aux_buf"_a,
         "Reveal a vector share to all three parties.  out must be pre-allocated to the\n"
-        "  correct size.  Filled with the reconstructed plaintext.  auxBuf is scratch space."
+        "  correct size.  Filled with the reconstructed plaintext.  aux_buf is scratch space."
     );
 
     // ——— byte counters ———

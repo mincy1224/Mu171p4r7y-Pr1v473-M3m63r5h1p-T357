@@ -296,7 +296,7 @@ class AgentServer:
             self._rep3_inst_ell_root.reshare_vector(
                 vec=self._query_buf.nxt_share, 
                 sv=self._query_buf, 
-                auxBuf=pack_buf
+                aux_buf=pack_buf
             )
 
             dr_rep_share = self._rep3_inst_ell_root.dot(
@@ -363,7 +363,7 @@ class AgentServer:
             self._rep3_inst_ell_root.reshare_vector(
                 vec=self._query_buf.nxt_share, 
                 sv=self._query_buf, 
-                auxBuf=pack_buf
+                aux_buf=pack_buf
             )
 
             dr_rep_share = self._rep3_inst_ell_root.dot(
