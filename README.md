@@ -14,16 +14,18 @@ multi-party set data confidential.
 
 ```
   ┌─ Python ─────────────────────────────────────────────┐
-  │  ProtocolHandler  QueryServer                        │
-  │  MpmtServerLeader SetHolder  TreeCache           │
+  │  AgentServer SetHolder Querier                       │
+  │  _TreeCache                                          │
   ├─ C++ bindings ───────────────────────────────────────┤
-  │  nanobind 2.13  ·  shared_ptr IOChannel registry     │
+  │  nanobind  ·  shared_ptr IOChannel registry          │
   │  GIL-safe I/O   ·  factory dispatch                  │
   ├─ C++ core ───────────────────────────────────────────┤
   │  Rvector        SIMD-packed ring arithmetic  (1..8)  │
   │  ABY3           3-party replicated RSS       (1..6)  │
   │  EMP2           2-party additive sharing    (2..31)  │
   │  BGI16          distributed point function (13..31)  │
+  │  RingTransport                                       │
+  │  Utils                                               │
   └──────────────────────────────────────────────────────┘
 ```
 
