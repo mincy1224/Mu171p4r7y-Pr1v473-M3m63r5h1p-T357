@@ -4,21 +4,33 @@ Wraps `emp::NetIO`. Requires two parties communicating over TCP.
 
 ## Construction
 
-Two modes:
-
 | Constructor | Role | Behavior |
 |------|------|------|
 | `Channel(port)` | Server | Listens on port, blocks until client connects |
-| `Channel(host, port)` | Client | Connects to remote, retries indefinitely until success |
+| `Channel(host, port)` | Client | Connects to remote, emp-internal retry (indefinite) |
+| `Channel(host, port, retry_timeout=N)` | Client | Connects to remote, Python-side retry with timeout in seconds |
+| `Channel(sock=...)` | — | Wraps an already-connected Python socket (takes ownership) |
 
 ```python
 from mpmt.channels import Channel
 
-ch_srv = Channel(port=14000)                      # server
-ch_cli = Channel(host="127.0.0.1", port=14000)    # client
+# server
+ch_srv = Channel(port=14000)
+
+# client — indefinite retry (emp-internal)
+ch_cli = Channel("127.0.0.1", 14000)
+
+# client — retry with 5-second timeout (Python-side)
+ch_cli = Channel("127.0.0.1", 14000, retry_timeout=5.0)
+
+# wrap an existing connected socket
+import socket
+s = socket.socket()
+s.connect(("127.0.0.1", 14000))
+ch = Channel(sock=s)
 ```
 
-Both ends block until the connection is established. The port must be bound on the server before the client.
+All constructors block until the connection is established (or timeout expires).
 
 ## Methods
 
@@ -42,7 +54,10 @@ add2_inst = mpmt.ShrAdd2(ell=14, party=0)(ch)
 add2_inst = mpmt.ShrAdd2(ell=4, party=0)(ch)  # overwrite variable
 ```
 
-## Low-level Socket Helpers
+## Low-level Helpers
+
+`wrap_socket` and `connect_retry` are **deprecated** in favour of the `sock=` and `retry_timeout=`
+constructor arguments. They are retained for compatibility.
 
 ### wrap_socket
 
@@ -53,9 +68,11 @@ Procedure: `dup(sock.fileno())` → `sock.close()` → `NetIO_from_socket(fd)`.
 Returns a NetIO handle (`int`). NetIO takes exclusive ownership of the fd;
 the Python side no longer holds the socket.
 
+Prefer `Channel(sock=s)` instead.
+
 ### connect_retry
 
-`connect_retry(host, port)` — Connect to remote, retrying indefinitely until success.
+`connect_retry(host, port, timeout=None)` — Connect to remote with optional timeout.
 
 ```python
 while True:
@@ -63,10 +80,13 @@ while True:
         s.connect((host, port))
         return s
     except (ConnectionRefusedError, OSError):
-        pass
+        if timeout is not None and time.monotonic() >= deadline:
+            raise TimeoutError(...)
 ```
 
 Returns a connected Python `socket`, intended for use with `wrap_socket`.
+
+Prefer `Channel(host, port, retry_timeout=N)` instead.
 
 ### Rationale
 
