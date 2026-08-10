@@ -38,16 +38,17 @@ def _c3_make_user_id() -> str:
 
 
 def _c3_clean_storage(storage_dir: str) -> None:
+    """Remove only protocol-created directories, leave user files untouched."""
     if not os.path.isdir(storage_dir):
         return
+    # only delete directories that are part of the protocol deployment
+    _KNOWN_DIRS = {"manage_server", "steward", "peer0", "peer1"}
     for name in os.listdir(storage_dir):
-        if name == "download":
-            continue
         path = os.path.join(storage_dir, name)
-        if os.path.isdir(path):
+        if not os.path.isdir(path):
+            continue
+        if name in _KNOWN_DIRS or name.startswith("set_holder_"):
             shutil.rmtree(path)
-        else:
-            os.remove(path)
 
 
 def _c3_generate_fake_set(size: int) -> list[str]:
