@@ -1,0 +1,31 @@
+{
+    "timeout": 30.0,
+    "dpf_cores": 16,
+    "storage_root_dir": "storage",
+    "manage_server": {
+        "server_ip": "127.0.0.1",
+        "http_port": 5000,
+        "mgmt_port_steward": 13000,
+        "mgmt_port_peer0": 13001,
+        "mgmt_port_peer1": 13002,
+        "db_name": "c3.db"
+    },
+    "steward": {
+        "ip": "127.0.0.1",
+        "mgmt_port": 13000,
+        "ch_prev_port": 14000,
+        "ch_nxt_port": 14001
+    },
+    "peer0": {
+        "ip": "127.0.0.1",
+        "mgmt_port": 13001,
+        "ch_prev_port": 14001,
+        "ch_nxt_port": 14002
+    },
+    "peer1": {
+        "ip": "127.0.0.1",
+        "mgmt_port": 13002,
+        "ch_prev_port": 14002,
+        "ch_nxt_port": 14000
+    }
+}

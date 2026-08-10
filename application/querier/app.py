@@ -1,0 +1,106 @@
+# draft
+import json
+import os
+import time
+import urllib.request
+
+import mpmt
+
+from _c3_io import read_json
+
+_APP_DIR = os.path.join(os.path.dirname(__file__), "..")
+QUERIER_USERS = os.path.join(_APP_DIR, "pretreat", "querier_users.json")
+
+
+class C3Querier:
+    def __init__(self, user_id: str, element: bytes):
+        _dir = os.path.dirname(__file__)
+        cfg_root = read_json(os.path.join(_dir, "..", "config.json"))
+        self._cfg = cfg_root["manage_server"]
+        self._timeout = cfg_root["timeout"]
+        preset = read_json(os.path.join(_dir, "..", "pretreat", "pre.json"))
+
+        self._user_id = user_id
+        self._manage_url = (f"http://{self._cfg['server_ip']}:"
+                            f"{self._cfg['http_port']}")
+        self._element = element
+
+        self._prot_inst = mpmt.Querier(
+            set_size=preset["set_size"],
+            fpr_mantissa=preset["fpr_mantissa"],
+            fpr_exponent=preset["fpr_exponent"],
+        )
+
+    def _post(self, route: str, body: dict) -> dict:
+        url = f"{self._manage_url}{route}"
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(url, data=data,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            return json.loads(resp.read())
+
+    # protocol
+    def run_protocol(self, ports: dict) -> int:
+        ch_steward = mpmt.Channel(self._cfg["server_ip"], ports["STEWARD"])
+        ch_peer0 = mpmt.Channel(self._cfg["server_ip"], ports["PEER0"])
+        ch_peer1 = mpmt.Channel(self._cfg["server_ip"], ports["PEER1"])
+
+        return self._prot_inst.query(
+            element=self._element,
+            ch_steward=ch_steward,
+            ch_peer0=ch_peer0,
+            ch_peer1=ch_peer1,
+        )
+
+    # flow
+    def query(self) -> dict:
+        resp = self._post("/reserve_query", {"user_id": self._user_id})
+        if resp.get("status") == "REJECTED":
+            return resp
+        op_id = resp.get("op_id")
+
+        result = None
+        protocol_started = False
+        while True:
+            resp = self._post("/execute", {"op_id": op_id})
+            status = resp.get("status")
+
+            if status == "DONE":
+                resp["result"] = result
+                return resp
+            if status in ("REMOVED", "FAILED", "NOT_FOUND"):
+                return resp
+            if status == "WAITING":
+                time.sleep(1)
+                continue
+            if status == "BUSY":
+                if not protocol_started:
+                    protocol_started = True
+                    ports = {
+                        "STEWARD": resp["port_steward"],
+                        "PEER0": resp["port_peer0"],
+                        "PEER1": resp["port_peer1"],
+                    }
+                    result = self.run_protocol(ports)
+                time.sleep(1)
+                continue
+
+            return resp
+
+    # CLI
+    @classmethod
+    def run_cli(cls, args: list[str] | None = None) -> None:
+        if args is None:
+            args = []
+
+        if not args:
+            print("usage: python run.py querier <user_id> <element>")
+            return
+
+        user_id = args[0]
+        element = args[1] if len(args) > 1 else input("element: ").strip()
+        element = element.encode()
+
+        q = cls(user_id, element)
+        result = q.query()
+        print(json.dumps(result, indent=2))
