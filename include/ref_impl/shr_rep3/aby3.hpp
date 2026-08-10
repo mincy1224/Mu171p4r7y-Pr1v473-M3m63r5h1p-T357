@@ -50,7 +50,7 @@ public:
     Aby3(emp::IOChannel* nioToPrev, emp::IOChannel* nioToNext)
         : nioToPrev_(nioToPrev), nioToNext_(nioToNext),
           cRngId_(_mm_setzero_si128()),
-          crngPtr_(BLOCK_CAPACITY * 8) // starts exhausted for both byte and bit modes
+          crngPtr_(BLOCK_CAPACITY * 8) // start exhausted, forces refill on first use
     {
         if (sodium_init() < 0)
         {
@@ -734,29 +734,37 @@ public:
     }
 
     // CRNG — ELL_V selects the target ring explicitly.
+    // Scalar cache: a single 128-bit buffer, consumed in bit-sized (1 bit)
+    // or byte-sized (8 bits) chunks.  crngIsXor_ tracks how the current
+    // cache was computed; a mode switch forces a refill so that each PRF
+    // counter value is consumed under exactly one interpretation.
     template <uint64_t ELL_V = ELL> uint8_t crng()
     {
         if constexpr (ELL_V == 1)
         {
-            // Bit-level: extract all 128 bits from crngCache_ one by one.
-            if (crngPtr_ >= BLOCK_CAPACITY * 8)
+            if (crngPtr_ >= BLOCK_CAPACITY * 8 || !crngIsXor_)
             {
-                refillCrngCache();
+                refillCrngCache(true);
                 crngPtr_ = 0;
+                crngIsXor_ = true;
             }
-            uint8_t bit =
-                (reinterpret_cast<uint8_t*>(&crngBitCache_)[crngPtr_ / 8] >> (crngPtr_ % 8)) & 1;
+            uint8_t bit = (reinterpret_cast<uint8_t*>(&crngCache_)[crngPtr_ / 8]
+                            >> (crngPtr_ % 8)) & 1;
             ++crngPtr_;
             return bit;
         }
         else
         {
-            if (crngPtr_ >= BLOCK_CAPACITY)
+            if (crngPtr_ >= BLOCK_CAPACITY * 8 || crngIsXor_)
             {
-                refillCrngCache();
+                refillCrngCache(false);
                 crngPtr_ = 0;
+                crngIsXor_ = false;
             }
-            return reinterpret_cast<uint8_t*>(&crngCache_)[crngPtr_++] & math::RING_MASK8<ELL_V>;
+            uint8_t val = reinterpret_cast<uint8_t*>(&crngCache_)[crngPtr_ / 8]
+                          & math::RING_MASK8<ELL_V>;
+            crngPtr_ += 8;
+            return val;
         }
     }
 
@@ -876,25 +884,18 @@ public:
 private:
     static constexpr size_t BLOCK_CAPACITY = 16;
 
-    void refillCrngCache()
+    void refillCrngCache(bool isXor)
     {
         __m128i rawThis = ccrhThis_.H(cRngId_);
         __m128i rawPrev = ccrhPrev_.H(cRngId_);
 
-        //  Byte-level subtraction — correct for ELL>1 byte values.
-        crngCache_ = _mm_sub_epi8(rawThis, rawPrev);
-
-        //  Bit-level XOR — needed for ELL=1 bit extraction (subtraction
-        //  borrows would break the per-bit cancellation).
-        crngBitCache_ = _mm_xor_si128(rawThis, rawPrev);
+        crngCache_ = isXor ? _mm_xor_si128(rawThis, rawPrev)
+                           : _mm_sub_epi8(rawThis, rawPrev);
 
         uint64_t counter[2];
         std::memcpy(counter, &cRngId_, sizeof(cRngId_));
         if (++counter[0] == 0)
-        {
             ++counter[1];
-        }
-
         std::memcpy(&cRngId_, counter, sizeof(cRngId_));
     }
 
@@ -903,8 +904,8 @@ private:
     emp::CCRH ccrhThis_;
     emp::CCRH ccrhPrev_;
     __m128i crngCache_;
-    __m128i crngBitCache_;
-    uint8_t crngPtr_;
+    uint8_t crngPtr_;  // bit offset within crngCache_ (0..127)
+    bool crngIsXor_ = false;
 
     // ── Persistent I/O worker threads for _reshare_ring ──
     std::thread sendWorker_, recvWorker_;
