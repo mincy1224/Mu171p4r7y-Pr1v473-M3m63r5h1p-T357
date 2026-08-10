@@ -21,14 +21,17 @@ Schema
     created_at     TEXT NOT NULL
     updated_at     TEXT NOT NULL
 
-  user_tokens
-    user_id     TEXT PRIMARY KEY  REFERENCES users(user_id)
+  user_agent_tokens
+    user_id     TEXT NOT NULL  REFERENCES users(user_id)
+    agent_role  TEXT NOT NULL  — STEWARD|PEER0|PEER1
     token      TEXT NOT NULL
     updated_at TEXT NOT NULL
+    PRIMARY KEY (user_id, agent_role)
 """
 
 import os
 import sqlite3
+import threading
 import time
 
 from _c3_io import ensure_dir, read_json
@@ -50,6 +53,7 @@ class DB:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        self._lock = threading.RLock()
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -72,10 +76,12 @@ class DB:
                 updated_at     TEXT NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             );
-            CREATE TABLE IF NOT EXISTS user_tokens (
-                user_id    TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS user_agent_tokens (
+                user_id    TEXT NOT NULL,
+                agent_role TEXT NOT NULL,
                 token      TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, agent_role),
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             );
             CREATE INDEX IF NOT EXISTS idx_ops_queue
@@ -85,6 +91,20 @@ class DB:
             CREATE INDEX IF NOT EXISTS idx_ops_user
                 ON operations(user_id);
         """)
+        # migration: error_code column (added after initial schema)
+        try:
+            self._conn.execute(
+                "ALTER TABLE operations ADD COLUMN error_code TEXT")
+        except sqlite3.OperationalError:
+            pass
+        # one live operation per user (defense-in-depth against races)
+        try:
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_live_op_per_user "
+                "ON operations(user_id) "
+                "WHERE status IN ('QUEUED','ACTIVE','BUSY')")
+        except sqlite3.OperationalError:
+            pass
         self._conn.commit()
 
     # users
@@ -169,12 +189,22 @@ class DB:
         ).fetchone()
         return row is not None
 
+    def get_active_operation_by_user(self, user_id: str) -> dict | None:
+        """Return the live operation for *user_id*, if any."""
+        row = self._conn.execute(
+            "SELECT * FROM operations "
+            "WHERE user_id=? AND status IN ('QUEUED','ACTIVE','BUSY') "
+            "ORDER BY op_id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
     def update_operation(self, op_id: int, status: str, **kwargs) -> None:
-        """Update status + optional fields (queue_pos, overtime_count)."""
+        """Update status + optional fields (queue_pos, overtime_count, error_code)."""
         now = _now()
         sets = ["status=?", "updated_at=?"]
         params = [status, now]
-        for col in ("queue_pos", "overtime_count"):
+        for col in ("queue_pos", "overtime_count", "error_code"):
             if col in kwargs:
                 sets.append(f"{col}=?")
                 params.append(kwargs[col])
@@ -187,25 +217,84 @@ class DB:
 
     # tokens
 
-    def set_token(self, user_id: str, token: str) -> None:
+    # tokens — per-agent (STEWARD / PEER0 / PEER1 each have their own)
+
+    def set_agent_token(self, user_id: str, agent_role: str, token: str) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO user_tokens (user_id, token, updated_at) "
-            "VALUES (?,?,?)",
-            (user_id, token, _now()),
+            "INSERT OR REPLACE INTO user_agent_tokens "
+            "(user_id, agent_role, token, updated_at) VALUES (?,?,?,?)",
+            (user_id, agent_role, token, _now()),
         )
         self._conn.commit()
 
-    def get_token(self, user_id: str) -> str | None:
+    def get_agent_token(self, user_id: str, agent_role: str) -> str | None:
         row = self._conn.execute(
-            "SELECT token FROM user_tokens WHERE user_id=?", (user_id,),
+            "SELECT token FROM user_agent_tokens "
+            "WHERE user_id=? AND agent_role=?",
+            (user_id, agent_role),
         ).fetchone()
         return row["token"] if row else None
 
-    def delete_token(self, user_id: str) -> None:
+    def delete_agent_tokens(self, user_id: str) -> None:
         self._conn.execute(
-            "DELETE FROM user_tokens WHERE user_id=?", (user_id,),
+            "DELETE FROM user_agent_tokens WHERE user_id=?", (user_id,),
         )
         self._conn.commit()
+
+    # atomic multi-table operations
+
+    def complete_join(self, op_id: int, user_id: str,
+                      tokens: dict[str, str]) -> None:
+        """Atomically mark operation DONE + store per-agent tokens + set user JOINED.
+        *tokens* maps agent role (STEWARD/PEER0/PEER1) → token string."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            now = _now()
+            self._conn.execute(
+                "UPDATE operations SET status='DONE', queue_pos=NULL, "
+                "updated_at=? WHERE op_id=?", (now, op_id))
+            for role, token in tokens.items():
+                if token:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO user_agent_tokens "
+                        "(user_id, agent_role, token, updated_at) "
+                        "VALUES (?,?,?,?)",
+                        (user_id, role, token, now))
+            self._conn.execute(
+                "UPDATE users SET status='JOINED', updated_at=? "
+                "WHERE user_id=?", (now, user_id))
+            self._conn.commit()
+
+    def complete_quit(self, op_id: int, user_id: str) -> None:
+        """Atomically mark operation DONE + delete all agent tokens + set user QUITTED."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            now = _now()
+            self._conn.execute(
+                "UPDATE operations SET status='DONE', queue_pos=NULL, "
+                "updated_at=? WHERE op_id=?", (now, op_id))
+            self._conn.execute(
+                "DELETE FROM user_agent_tokens WHERE user_id=?", (user_id,))
+            self._conn.execute(
+                "UPDATE users SET status='QUITTED', updated_at=? "
+                "WHERE user_id=?", (now, user_id))
+            self._conn.commit()
+
+    def fail_operation(self, op_id: int, error_code: str) -> None:
+        """Mark operation FAILED with an error code."""
+        self.update_operation(op_id, "FAILED", queue_pos=None,
+                            error_code=error_code)
+
+    def reconcile_on_startup(self) -> int:
+        """Fail any ACTIVE/BUSY operations left over from a previous crash.
+        Returns the number of operations reconciled."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE operations SET status='FAILED', queue_pos=NULL, "
+                "error_code='MANAGER_RESTART', updated_at=? "
+                "WHERE status IN ('ACTIVE','BUSY')", (_now(),))
+            self._conn.commit()
+            return cur.rowcount
 
     # queue
 
@@ -294,7 +383,8 @@ class DB:
 
     def remove_from_queue(self, op_id: int) -> None:
         """Mark operation REMOVED, clear queue_pos, set overtime_count=3."""
-        self.update_operation(op_id, "REMOVED", queue_pos=None, overtime_count=3)
+        self.update_operation(op_id, "REMOVED", queue_pos=None,
+                            overtime_count=3, error_code="OVERTIME_REMOVED")
         self.reorder_queue()
 
     def promote_first_queued(self) -> dict | None:
