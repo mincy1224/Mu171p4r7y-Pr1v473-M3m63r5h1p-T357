@@ -24,8 +24,8 @@ class C3AgentServer:
         self._timeout = cfg["timeout"]
         self._conn: socket.socket | None = None
         self._reserved: dict[str, tuple[int, socket.socket]] = {}
-        self._user_id_to_token: dict[str, str] = {}
         self._send_lock = threading.Lock()
+        self._generation = 0  # incremented per Manager connection
 
         # mpmt protocol instance
         _NEXT = {"steward": "peer0", "peer0": "peer1", "peer1": "steward"}
@@ -79,7 +79,7 @@ class C3AgentServer:
     # command handlers
 
     def cmd_reserve(self, user_id: str, prot_type: str,
-                    request_id: str = "") -> None:
+                    request_id: str = "", _send_gen: int = 0) -> None:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -88,13 +88,15 @@ class C3AgentServer:
             port = s.getsockname()[1]
             self._reserved[self._reserve_key(user_id, prot_type)] = (port, s)
             self._send({"event": "RESERVED", "user_id": user_id,
-                        "port": port, "request_id": request_id})
+                        "port": port, "request_id": request_id}, _gen=_send_gen)
         except Exception as e:
             self._send({"event": "ERROR", "user_id": user_id,
-                        "msg": str(e), "request_id": request_id})
+                        "msg": str(e), "request_id": request_id}, _gen=_send_gen)
 
     def cmd_execute(self, user_id: str, prot_type: str,
-                    request_id: str = "") -> None:
+                    request_id: str = "", _send_gen: int = 0,
+                    token: str = "") -> None:
+        """token is supplied by Manager for UPDATE/QUIT (from DB)."""
         try:
             match prot_type:
                 case "JOIN":
@@ -103,7 +105,7 @@ class C3AgentServer:
                     if entry is None:
                         self._send({"event": "ERROR", "user_id": user_id,
                                     "msg": "no reserved port",
-                                    "request_id": request_id})
+                                    "request_id": request_id}, _gen=_send_gen)
                         return
                     port, reserved_sock = entry
                     reserved_sock.close()
@@ -112,10 +114,9 @@ class C3AgentServer:
                         prot_type=mpmt.ProtType.JOIN,
                         ch_set_holder=ch_set_holder,
                     )
-                    self._user_id_to_token[user_id] = agent_token
                     self._send({"event": "DONE", "user_id": user_id,
                                 "agent_token": agent_token,
-                                "request_id": request_id})
+                                "request_id": request_id}, _gen=_send_gen)
 
                 case "UPDATE":
                     entry = self._reserved.pop(
@@ -123,24 +124,23 @@ class C3AgentServer:
                     if entry is None:
                         self._send({"event": "ERROR", "user_id": user_id,
                                     "msg": "no reserved port",
-                                    "request_id": request_id})
+                                    "request_id": request_id}, _gen=_send_gen)
                         return
-                    if user_id not in self._user_id_to_token:
+                    if not token:
                         self._send({"event": "ERROR", "user_id": user_id,
                                     "msg": "not joined yet",
-                                    "request_id": request_id})
+                                    "request_id": request_id}, _gen=_send_gen)
                         return
                     port, reserved_sock = entry
                     reserved_sock.close()
                     ch_set_holder = mpmt.Channel(port=port)
-                    token = self._user_id_to_token[user_id]
                     self.prot_inst.response_share_bf(
                         prot_type=mpmt.ProtType.UPDATE,
                         ch_set_holder=ch_set_holder,
                         token=token,
                     )
                     self._send({"event": "DONE", "user_id": user_id,
-                                "request_id": request_id})
+                                "request_id": request_id}, _gen=_send_gen)
 
                 case "QUERY":
                     entry = self._reserved.pop(
@@ -148,36 +148,35 @@ class C3AgentServer:
                     if entry is None:
                         self._send({"event": "ERROR", "user_id": user_id,
                                     "msg": "no reserved port",
-                                    "request_id": request_id})
+                                    "request_id": request_id}, _gen=_send_gen)
                         return
                     port, reserved_sock = entry
                     reserved_sock.close()
                     ch_querier = mpmt.Channel(port=port)
                     self.prot_inst.response_query(ch_querier=ch_querier)
                     self._send({"event": "DONE", "user_id": user_id,
-                                "request_id": request_id})
+                                "request_id": request_id}, _gen=_send_gen)
 
                 case "QUIT":
-                    if user_id not in self._user_id_to_token:
+                    if not token:
                         self._send({"event": "ERROR", "user_id": user_id,
                                     "msg": "not joined yet",
-                                    "request_id": request_id})
+                                    "request_id": request_id}, _gen=_send_gen)
                         return
-                    token = self._user_id_to_token.pop(user_id)
                     self.prot_inst.response_share_bf(
                         prot_type=mpmt.ProtType.QUIT,
                         token=token,
                     )
                     self._send({"event": "DONE", "user_id": user_id,
-                                "request_id": request_id})
+                                "request_id": request_id}, _gen=_send_gen)
 
                 case _:
                     self._send({"event": "ERROR", "user_id": user_id,
                                 "msg": f"unknown prot_type: {prot_type}",
-                                "request_id": request_id})
+                                "request_id": request_id}, _gen=_send_gen)
         except Exception as e:
             self._send({"event": "ERROR", "user_id": user_id,
-                        "msg": str(e), "request_id": request_id})
+                        "msg": str(e), "request_id": request_id}, _gen=_send_gen)
 
     _INSTRUCTIONS: dict[str, str] = {
         "RESERVE": "cmd_reserve",
@@ -195,6 +194,14 @@ class C3AgentServer:
 
         while True:
             self._conn, addr = srv.accept()
+            self._generation += 1
+            # clean up reservations from previous Manager session
+            for _key, (_port, sock) in self._reserved.items():
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            self._reserved.clear()
             print(f"[{self._role}] management connected from {addr}")
             try:
                 self._recv_loop()
@@ -233,13 +240,17 @@ class C3AgentServer:
         user_id = cmd.get("user_id", "")
         prot_type = cmd.get("prot_type", "")
         request_id = cmd.get("request_id", "")
+        token = cmd.get("token", "")
+        gen = self._generation  # capture so stale workers drop results
         self._send({"event": "READY", "user_id": user_id,
                     "request_id": request_id})
         method = getattr(self, method_name)
         threading.Thread(target=method,
-                         args=(user_id, prot_type, request_id),
+                         args=(user_id, prot_type, request_id, gen, token),
                          daemon=True).start()
 
-    def _send(self, msg: dict) -> None:
+    def _send(self, msg: dict, *, _gen: int | None = None) -> None:
+        if _gen is not None and _gen != self._generation:
+            return  # stale worker from previous Manager session, drop
         with self._send_lock:
             self._conn.sendall(json.dumps(msg).encode() + b"\n")
