@@ -18,6 +18,7 @@ class C3Querier:
         cfg_root = read_json(os.path.join(_dir, "..", "config.json"))
         self._cfg = cfg_root["manage_server"]
         self._timeout = cfg_root["timeout"]
+        self._connect_timeout = cfg_root.get("connect_timeout", 5.0)
         preset = read_json(os.path.join(_dir, "..", "pretreat", "pre.json"))
 
         self._user_id = user_id
@@ -40,10 +41,16 @@ class C3Querier:
             return json.loads(resp.read())
 
     # protocol
-    def run_protocol(self, ports: dict) -> int:
-        ch_steward = mpmt.Channel(self._cfg["server_ip"], ports["STEWARD"])
-        ch_peer0 = mpmt.Channel(self._cfg["server_ip"], ports["PEER0"])
-        ch_peer1 = mpmt.Channel(self._cfg["server_ip"], ports["PEER1"])
+    def run_protocol(self, agents: dict) -> int:
+        ch_steward = mpmt.Channel(agents["STEWARD"]["ip"],
+                                  agents["STEWARD"]["port"],
+                                  retry_timeout=self._connect_timeout)
+        ch_peer0 = mpmt.Channel(agents["PEER0"]["ip"],
+                                agents["PEER0"]["port"],
+                                retry_timeout=self._connect_timeout)
+        ch_peer1 = mpmt.Channel(agents["PEER1"]["ip"],
+                                agents["PEER1"]["port"],
+                                retry_timeout=self._connect_timeout)
 
         return self._prot_inst.query(
             element=self._element,
@@ -57,7 +64,11 @@ class C3Querier:
         resp = self._post("/reserve_query", {"user_id": self._user_id})
         if resp.get("status") == "REJECTED":
             return resp
+        if resp.get("status") not in ("SUCCESSFUL", "ALREADY"):
+            return resp
         op_id = resp.get("op_id")
+        if not op_id:
+            return {"status": "FAILED", "reason": "no op_id in response"}
 
         result = None
         protocol_started = False
@@ -76,12 +87,7 @@ class C3Querier:
             if status == "BUSY":
                 if not protocol_started:
                     protocol_started = True
-                    ports = {
-                        "STEWARD": resp["port_steward"],
-                        "PEER0": resp["port_peer0"],
-                        "PEER1": resp["port_peer1"],
-                    }
-                    result = self.run_protocol(ports)
+                    result = self.run_protocol(resp["agents"])
                 time.sleep(1)
                 continue
 

@@ -19,6 +19,7 @@ class C3SetHolder:
         cfg_root = read_json(os.path.join(_dir, "..", "config.json"))
         self._cfg = cfg_root["manage_server"]
         self._timeout = cfg_root["timeout"]
+        self._connect_timeout = cfg_root.get("connect_timeout", 5.0)
         preset = read_json(os.path.join(_dir, "..", "pretreat", "pre.json"))
 
         self._user_id = user_id
@@ -41,10 +42,16 @@ class C3SetHolder:
             return json.loads(resp.read())
 
     # protocol
-    def run_protocol(self, ports: dict, data_set: list[bytes]) -> None:
-        ch_steward = mpmt.Channel(self._cfg["server_ip"], ports["STEWARD"])
-        ch_peer0 = mpmt.Channel(self._cfg["server_ip"], ports["PEER0"])
-        ch_peer1 = mpmt.Channel(self._cfg["server_ip"], ports["PEER1"])
+    def run_protocol(self, agents: dict, data_set: list[bytes]) -> None:
+        ch_steward = mpmt.Channel(agents["STEWARD"]["ip"],
+                                  agents["STEWARD"]["port"],
+                                  retry_timeout=self._connect_timeout)
+        ch_peer0 = mpmt.Channel(agents["PEER0"]["ip"],
+                                agents["PEER0"]["port"],
+                                retry_timeout=self._connect_timeout)
+        ch_peer1 = mpmt.Channel(agents["PEER1"]["ip"],
+                                agents["PEER1"]["port"],
+                                retry_timeout=self._connect_timeout)
 
         self._prot_inst.share_bf(
             set=data_set,
@@ -61,7 +68,11 @@ class C3SetHolder:
                           {"user_id": self._user_id})
         if resp.get("status") == "REJECTED":
             return resp
+        if resp.get("status") not in ("SUCCESSFUL", "ALREADY"):
+            return resp
         op_id = resp.get("op_id")
+        if not op_id:
+            return {"status": "FAILED", "reason": "no op_id in response"}
 
         protocol_started = False
         while True:
@@ -77,15 +88,11 @@ class C3SetHolder:
                 continue
             if status == "BUSY":
                 if prot_type == "QUIT":
+                    time.sleep(1)
                     continue
                 if not protocol_started:
                     protocol_started = True
-                    ports = {
-                        "STEWARD": resp["port_steward"],
-                        "PEER0": resp["port_peer0"],
-                        "PEER1": resp["port_peer1"],
-                    }
-                    self.run_protocol(ports, data_set or [])
+                    self.run_protocol(resp["agents"], data_set or [])
                 time.sleep(1)
                 continue
 
@@ -122,8 +129,8 @@ class C3SetHolder:
             data_set = [str(x).encode() for x in arr]
             print(f"[set_holder] loaded {len(data_set)} elements from {npy_path}")
         else:
-            print(f"warning: {npy_path} not found, joining with empty set")
-            data_set = []
+            print(f"error: {npy_path} not found")
+            return
 
         sh = cls(user_id)
         result = sh.join(data_set=data_set)

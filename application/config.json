@@ -1,5 +1,6 @@
 {
     "timeout": 30.0,
+    "connect_timeout": 5.0,
     "dpf_cores": 16,
     "storage_root_dir": "storage",
     "manage_server": {
