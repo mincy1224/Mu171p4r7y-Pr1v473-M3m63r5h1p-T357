@@ -852,6 +852,7 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
                 throw std::out_of_range(
                     "Rvector::set: index " + std::to_string(i)
                     + " out of range [0, " + std::to_string(n_) + ")");
+            checkRing(val);
             if constexpr (ELL == 1)
             {
                 if (val & 1)
@@ -865,7 +866,7 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
             }
             else
             {
-                data_[i] = val & PER_BYTE_MASK;
+                data_[i] = val;
             }
         }
 
@@ -934,8 +935,11 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         }
 
         /// @name Element-wise arithmetic
-        /// @note add / sub support in-place (out may alias a or b).
-        ///       hadamard forbids aliasing (out must not alias inputs).
+        /// @note All element-wise ops support in-place (out may alias a
+        ///       or b).  Callers that reallocate on size mismatch (e.g.
+        ///       ABY3 hadamard_vec) must enforce no-alias at their own
+        ///       level — a realloc through an aliased reference destroys
+        ///       the input.
         /// @{
 
         /// @brief out[i] = (a[i] + b[i]) mod 2^ELL
@@ -1045,8 +1049,12 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
 
     // CRITICAL: extract raw pointers BEFORE the loop with __restrict__,
     // otherwise clang cannot deduce array bounds and falls back to scalar code.
+    //
+    // add / sub support in-place (out may alias a or b — ABY3 add_vec
+    // requires it).  We detect aliasing at runtime: the fast path keeps
+    // __restrict__ on po so clang auto-vectorises; the aliasing path drops
+    // it, avoiding the formal contradiction between restrict and overlap.
 
-    // Note: out may alias a or b (ABY3 add_vec supports in-place).
     template <uint64_t ELL>
     inline void _add(const Rvector<ELL>& a, const Rvector<ELL>& b, Rvector<ELL>& out)
     {
@@ -1054,32 +1062,51 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         if constexpr (ELL == 1)
         {
             const size_t w = a.words();
-            const auto* __restrict__ pa = a.data();
-            const auto* __restrict__ pb = b.data();
-            auto* __restrict__ po = out.data();
-            for (size_t i = 0; i < w; ++i)
-            {
-                po[i] = pa[i] ^ pb[i];
+            const auto* pa = a.data();
+            const auto* pb = b.data();
+            auto* const po = out.data();
+            if (po == pa || po == pb) {
+                for (size_t i = 0; i < w; ++i)
+                    po[i] = pa[i] ^ pb[i];
+            } else {
+                const auto* __restrict__ pa_r = pa;
+                const auto* __restrict__ pb_r = pb;
+                auto* __restrict__ po_r = po;
+                for (size_t i = 0; i < w; ++i)
+                    po_r[i] = pa_r[i] ^ pb_r[i];
             }
         }
         else
         {
-            const auto* __restrict__ pa = a.data();
-            const auto* __restrict__ pb = b.data();
-            auto* __restrict__ po = out.data();
-            if constexpr (ELL == 8)
-            {
-                for (size_t i = 0; i < n; ++i)
+            const auto* pa = a.data();
+            const auto* pb = b.data();
+            auto* const po = out.data();
+            if (po == pa || po == pb) {
+                if constexpr (ELL == 8)
                 {
-                    po[i] = pa[i] + pb[i];
+                    for (size_t i = 0; i < n; ++i)
+                        po[i] = pa[i] + pb[i];
                 }
-            }
-            else
-            {
-                constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
-                for (size_t i = 0; i < n; ++i)
+                else
                 {
-                    po[i] = (pa[i] + pb[i]) & M;
+                    constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
+                    for (size_t i = 0; i < n; ++i)
+                        po[i] = (pa[i] + pb[i]) & M;
+                }
+            } else {
+                const auto* __restrict__ pa_r = pa;
+                const auto* __restrict__ pb_r = pb;
+                auto* __restrict__ po_r = po;
+                if constexpr (ELL == 8)
+                {
+                    for (size_t i = 0; i < n; ++i)
+                        po_r[i] = pa_r[i] + pb_r[i];
+                }
+                else
+                {
+                    constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
+                    for (size_t i = 0; i < n; ++i)
+                        po_r[i] = (pa_r[i] + pb_r[i]) & M;
                 }
             }
         }
@@ -1094,22 +1121,35 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
             return;
         }
         const size_t n = a.size();
-        const auto* __restrict__ pa = a.data();
-        const auto* __restrict__ pb = b.data();
-        auto* __restrict__ po = out.data();
-        if constexpr (ELL == 8)
-        {
-            for (size_t i = 0; i < n; ++i)
+        const auto* pa = a.data();
+        const auto* pb = b.data();
+        auto* const po = out.data();
+        if (po == pa || po == pb) {
+            if constexpr (ELL == 8)
             {
-                po[i] = pa[i] - pb[i];
+                for (size_t i = 0; i < n; ++i)
+                    po[i] = pa[i] - pb[i];
             }
-        }
-        else
-        {
-            constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
-            for (size_t i = 0; i < n; ++i)
+            else
             {
-                po[i] = (pa[i] - pb[i]) & M;
+                constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
+                for (size_t i = 0; i < n; ++i)
+                    po[i] = (pa[i] - pb[i]) & M;
+            }
+        } else {
+            const auto* __restrict__ pa_r = pa;
+            const auto* __restrict__ pb_r = pb;
+            auto* __restrict__ po_r = po;
+            if constexpr (ELL == 8)
+            {
+                for (size_t i = 0; i < n; ++i)
+                    po_r[i] = pa_r[i] - pb_r[i];
+            }
+            else
+            {
+                constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
+                for (size_t i = 0; i < n; ++i)
+                    po_r[i] = (pa_r[i] - pb_r[i]) & M;
             }
         }
     }
@@ -1121,32 +1161,51 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         if constexpr (ELL == 1)
         {
             const size_t w = a.words();
-            const auto* __restrict__ pa = a.data();
-            const auto* __restrict__ pb = b.data();
-            auto* __restrict__ po = out.data();
-            for (size_t i = 0; i < w; ++i)
-            {
-                po[i] = pa[i] & pb[i];
+            const auto* pa = a.data();
+            const auto* pb = b.data();
+            auto* const po = out.data();
+            if (po == pa || po == pb) {
+                for (size_t i = 0; i < w; ++i)
+                    po[i] = pa[i] & pb[i];
+            } else {
+                const auto* __restrict__ pa_r = pa;
+                const auto* __restrict__ pb_r = pb;
+                auto* __restrict__ po_r = po;
+                for (size_t i = 0; i < w; ++i)
+                    po_r[i] = pa_r[i] & pb_r[i];
             }
         }
         else
         {
-            const auto* __restrict__ pa = a.data();
-            const auto* __restrict__ pb = b.data();
-            auto* __restrict__ po = out.data();
-            if constexpr (ELL == 8)
-            {
-                for (size_t i = 0; i < n; ++i)
+            const auto* pa = a.data();
+            const auto* pb = b.data();
+            auto* const po = out.data();
+            if (po == pa || po == pb) {
+                if constexpr (ELL == 8)
                 {
-                    po[i] = static_cast<uint8_t>(pa[i] * pb[i]);
+                    for (size_t i = 0; i < n; ++i)
+                        po[i] = static_cast<uint8_t>(pa[i] * pb[i]);
                 }
-            }
-            else
-            {
-                constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
-                for (size_t i = 0; i < n; ++i)
+                else
                 {
-                    po[i] = static_cast<uint8_t>((pa[i] * pb[i]) & M);
+                    constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
+                    for (size_t i = 0; i < n; ++i)
+                        po[i] = static_cast<uint8_t>((pa[i] * pb[i]) & M);
+                }
+            } else {
+                const auto* __restrict__ pa_r = pa;
+                const auto* __restrict__ pb_r = pb;
+                auto* __restrict__ po_r = po;
+                if constexpr (ELL == 8)
+                {
+                    for (size_t i = 0; i < n; ++i)
+                        po_r[i] = static_cast<uint8_t>(pa_r[i] * pb_r[i]);
+                }
+                else
+                {
+                    constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
+                    for (size_t i = 0; i < n; ++i)
+                        po_r[i] = static_cast<uint8_t>((pa_r[i] * pb_r[i]) & M);
                 }
             }
         }
@@ -1159,40 +1218,59 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         if constexpr (ELL == 1)
         {
             const size_t w = a.words();
-            const auto* __restrict__ pa = a.data();
-            auto* __restrict__ po = out.data();
-            if (scalar == 0)
-            {
-                for (size_t i = 0; i < w; ++i)
-                {
-                    po[i] = pa[i];
+            const auto* pa = a.data();
+            auto* const po = out.data();
+            if (po == pa) {
+                if (scalar == 0) {
+                    /* nop */
+                } else {
+                    for (size_t i = 0; i < w; ++i)
+                        po[i] = ~pa[i];
                 }
-            }
-            else
-            {
-                for (size_t i = 0; i < w; ++i)
+            } else {
+                const auto* __restrict__ pa_r = pa;
+                auto* __restrict__ po_r = po;
+                if (scalar == 0)
                 {
-                    po[i] = ~pa[i];
+                    for (size_t i = 0; i < w; ++i)
+                        po_r[i] = pa_r[i];
+                }
+                else
+                {
+                    for (size_t i = 0; i < w; ++i)
+                        po_r[i] = ~pa_r[i];
                 }
             }
         }
         else
         {
-            const auto* __restrict__ pa = a.data();
-            auto* __restrict__ po = out.data();
-            if constexpr (ELL == 8)
-            {
-                for (size_t i = 0; i < n; ++i)
+            const auto* pa = a.data();
+            auto* const po = out.data();
+            if (po == pa) {
+                if constexpr (ELL == 8)
                 {
-                    po[i] = pa[i] + scalar;
+                    for (size_t i = 0; i < n; ++i)
+                        po[i] = pa[i] + scalar;
                 }
-            }
-            else
-            {
-                constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
-                for (size_t i = 0; i < n; ++i)
+                else
                 {
-                    po[i] = (pa[i] + scalar) & M;
+                    constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
+                    for (size_t i = 0; i < n; ++i)
+                        po[i] = (pa[i] + scalar) & M;
+                }
+            } else {
+                const auto* __restrict__ pa_r = pa;
+                auto* __restrict__ po_r = po;
+                if constexpr (ELL == 8)
+                {
+                    for (size_t i = 0; i < n; ++i)
+                        po_r[i] = pa_r[i] + scalar;
+                }
+                else
+                {
+                    constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
+                    for (size_t i = 0; i < n; ++i)
+                        po_r[i] = (pa_r[i] + scalar) & M;
                 }
             }
         }
@@ -1207,21 +1285,33 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
             return;
         }
         const size_t n = a.size();
-        const auto* __restrict__ pa = a.data();
-        auto* __restrict__ po = out.data();
-        if constexpr (ELL == 8)
-        {
-            for (size_t i = 0; i < n; ++i)
+        const auto* pa = a.data();
+        auto* const po = out.data();
+        if (po == pa) {
+            if constexpr (ELL == 8)
             {
-                po[i] = pa[i] - scalar;
+                for (size_t i = 0; i < n; ++i)
+                    po[i] = pa[i] - scalar;
             }
-        }
-        else
-        {
-            constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
-            for (size_t i = 0; i < n; ++i)
+            else
             {
-                po[i] = (pa[i] - scalar) & M;
+                constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
+                for (size_t i = 0; i < n; ++i)
+                    po[i] = (pa[i] - scalar) & M;
+            }
+        } else {
+            const auto* __restrict__ pa_r = pa;
+            auto* __restrict__ po_r = po;
+            if constexpr (ELL == 8)
+            {
+                for (size_t i = 0; i < n; ++i)
+                    po_r[i] = pa_r[i] - scalar;
+            }
+            else
+            {
+                constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
+                for (size_t i = 0; i < n; ++i)
+                    po_r[i] = (pa_r[i] - scalar) & M;
             }
         }
     }
@@ -1233,40 +1323,59 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         if constexpr (ELL == 1)
         {
             const size_t w = a.words();
-            const auto* __restrict__ pa = a.data();
-            auto* __restrict__ po = out.data();
-            if (scalar == 1)
-            {
-                for (size_t i = 0; i < w; ++i)
-                {
-                    po[i] = pa[i];
+            const auto* pa = a.data();
+            auto* const po = out.data();
+            if (po == pa) {
+                if (scalar == 1) {
+                    /* nop */
+                } else {
+                    for (size_t i = 0; i < w; ++i)
+                        po[i] = 0;
                 }
-            }
-            else
-            {
-                for (size_t i = 0; i < w; ++i)
+            } else {
+                const auto* __restrict__ pa_r = pa;
+                auto* __restrict__ po_r = po;
+                if (scalar == 1)
                 {
-                    po[i] = 0;
+                    for (size_t i = 0; i < w; ++i)
+                        po_r[i] = pa_r[i];
+                }
+                else
+                {
+                    for (size_t i = 0; i < w; ++i)
+                        po_r[i] = 0;
                 }
             }
         }
         else
         {
-            const auto* __restrict__ pa = a.data();
-            auto* __restrict__ po = out.data();
-            if constexpr (ELL == 8)
-            {
-                for (size_t i = 0; i < n; ++i)
+            const auto* pa = a.data();
+            auto* const po = out.data();
+            if (po == pa) {
+                if constexpr (ELL == 8)
                 {
-                    po[i] = static_cast<uint8_t>(pa[i] * scalar);
+                    for (size_t i = 0; i < n; ++i)
+                        po[i] = static_cast<uint8_t>(pa[i] * scalar);
                 }
-            }
-            else
-            {
-                constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
-                for (size_t i = 0; i < n; ++i)
+                else
                 {
-                    po[i] = static_cast<uint8_t>((pa[i] * scalar) & M);
+                    constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
+                    for (size_t i = 0; i < n; ++i)
+                        po[i] = static_cast<uint8_t>((pa[i] * scalar) & M);
+                }
+            } else {
+                const auto* __restrict__ pa_r = pa;
+                auto* __restrict__ po_r = po;
+                if constexpr (ELL == 8)
+                {
+                    for (size_t i = 0; i < n; ++i)
+                        po_r[i] = static_cast<uint8_t>(pa_r[i] * scalar);
+                }
+                else
+                {
+                    constexpr uint8_t M = Rvector<ELL>::PER_BYTE_MASK;
+                    for (size_t i = 0; i < n; ++i)
+                        po_r[i] = static_cast<uint8_t>((pa_r[i] * scalar) & M);
                 }
             }
         }
