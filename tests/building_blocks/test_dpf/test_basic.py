@@ -238,7 +238,6 @@ def run_tests(small=False):
           r5[0][0] == "ok", f"dealer={r5[0]}")
 
     # ——— eval rejects invalid cores (in-process test) ——
-    # send_key doesn't validate party: 0→evaluator0, non-0→evaluator1
     import socket as _socket
     from mpmt.channels import Channel, wrap_socket
     a0, b0 = _socket.socketpair()

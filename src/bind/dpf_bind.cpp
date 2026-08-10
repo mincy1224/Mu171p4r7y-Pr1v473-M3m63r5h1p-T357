@@ -62,6 +62,9 @@ template <uint64_t ELL_IN, uint64_t ELL_OUT> struct DpfDealerT
 
     void sendKey(const std::string& key_json, int party)
     {
+        if (party != 0 && party != 1)
+            throw std::invalid_argument("send_key: party must be 0 or 1, got "
+                                        + std::to_string(party));
         auto key = nlohmann::json::parse(key_json).template get<typename DealerType::KeyType>();
         if (party == 0)
             dealer_->template sendKey<DpfPid::EVALUATOR_0>(key);
