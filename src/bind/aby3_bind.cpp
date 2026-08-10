@@ -279,6 +279,9 @@ template <ShrRep3Pid PID, uint64_t ELL> struct Rss3T
 
     void hadamard_vec(const ShareVecType& sv1, const ShareVecType& sv2, ShareVecType& out)
     {
+        if (&out == &sv1 || &out == &sv2)
+            throw std::invalid_argument("hadamard: out must not alias sv1 or sv2 "
+                                        "(realloc guard would destroy input)");
         if (out.size() != sv1.size())
         {
             out = ShareVecType(sv1.size());
