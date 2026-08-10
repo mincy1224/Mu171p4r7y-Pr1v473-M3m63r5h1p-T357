@@ -17,7 +17,7 @@ def run_tests(small=False):
     PASS = FAIL = 0
     print("=== DPF Basic ===")
 
-    # ——— DpfDealer / DpfEvaluator factories ——————————
+    # DpfDealer / DpfEvaluator factories
     test_pairs = [(13, 2)] if small else [(13, 2), (16, 4), (20, 6), (25, 6), (31, 2)]
 
     for ei, eo in test_pairs:
@@ -46,7 +46,7 @@ def run_tests(small=False):
         except (ValueError, RuntimeError):
             check(f"DpfEvaluator reject party={bad_party}", True)
 
-    # ——— Full DPF flow: gen→send_key→recv_key→eval→reveal ——
+    # Full DPF flow: gen→send_key→recv_key→eval→reveal
     test_flows = [(13, 2)] if small else [(13, 2), (16, 4), (20, 6)]
 
     for ei, eo in test_flows:
@@ -91,7 +91,7 @@ def run_tests(small=False):
         r = run_dpf(d_flow, ev_flow(0), ev_flow(1), timeout=120)
         check(f"{label} full flow", r[0][0] == "ok", f"dealer={r[0]}")
 
-        # ——— eval_range basic —————————————————————————
+        # eval_range basic
         bg = random.randint(0, max(0, vl - 20))
         ed = min(bg + random.randint(5, 20), vl - 1)
         rlen = ed - bg + 1
@@ -126,7 +126,7 @@ def run_tests(small=False):
         r2 = run_dpf(d_range, ev_range(0), ev_range(1), timeout=120)
         check(f"{label} eval_range [{bg},{ed}]", r2[0][0] == "ok", f"dealer={r2[0]}")
 
-        # ——— eval multithreaded ————————————————————————
+        # eval multithreaded 
         for cores in [1, 4] if not small else [1]:
             def d_mt(ch_e0, ch_e1):
                 DC = mpmt.DpfDealer(ei, eo)
@@ -156,7 +156,7 @@ def run_tests(small=False):
             r3 = run_dpf(d_mt, ev_mt(0), ev_mt(1), timeout=120)
             check(f"{label} eval cores={cores}", r3[0][0] == "ok")
 
-    # ——— gen parameter validation —————————————————————
+    # gen parameter validation 
     ei, eo = 13, 2
     vl = 1 << ei
 
@@ -195,7 +195,7 @@ def run_tests(small=False):
     for key, val in r4[0].items():
         check(f"DPF gen validation: {key}", val == "ok", f"got {val}")
 
-    # ——— eval_range wraparound ————————————————————————
+    # eval_range wraparound 
     (ei, eo) = (15, 6) if not small else (13, 2)
     vl = 1 << ei
     m = mpmt.ring_mask(eo)
@@ -237,17 +237,17 @@ def run_tests(small=False):
     check(f"DPF(EI={ei},EO={eo}) wraparound [{bg},{ed}]",
           r5[0][0] == "ok", f"dealer={r5[0]}")
 
-    # ——— eval rejects invalid cores (in-process test) ——
+    # eval rejects invalid cores (in-process test) 
     import socket as _socket
-    from mpmt.channels import Channel, wrap_socket
+    from mpmt.channels import Channel
     a0, b0 = _socket.socketpair()
     a1, b1 = _socket.socketpair()
-    ch_e0 = Channel._from_ptr(wrap_socket(a0))
-    ch_e1 = Channel._from_ptr(wrap_socket(a1))
+    ch_e0 = Channel(sock=a0)
+    ch_e1 = Channel(sock=a1)
     d = mpmt.DpfDealer(13, 2)(ch_e0, ch_e1)
     k0, k1 = d.gen(0, 1)
     EC = mpmt.DpfEvaluator(13, 2, 0)
-    ev = EC(Channel._from_ptr(wrap_socket(b0)))
+    ev = EC(Channel(sock=b0))
     Rv = mpmt.Rvector(2)
     buf = Rv(1 << 13)
     try:

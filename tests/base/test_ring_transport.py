@@ -2,7 +2,7 @@
 import sys, os, time, random, socket, multiprocessing as mp
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 import mpmt
-from mpmt.channels import Channel, wrap_socket, connect_retry
+from mpmt.channels import Channel
 
 PASS = FAIL = 0
 
@@ -93,7 +93,7 @@ def run_tests(small=False):
             try:
                 # Use a socketpair (both ends on same process — no race)
                 a, b = socket.socketpair()
-                ch = Channel._from_ptr(wrap_socket(a))
+                ch = Channel(sock=a)
                 rt = mpmt.RingTransport(ell)(ch)
                 rt.send_scalar(bad_val)
                 b.close()

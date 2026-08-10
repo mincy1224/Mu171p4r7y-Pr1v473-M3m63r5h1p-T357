@@ -2,7 +2,7 @@
 import sys, os, time, random, socket, multiprocessing as mp
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 import mpmt
-from mpmt.channels import Channel, wrap_socket, connect_retry
+from mpmt.channels import Channel
 
 PASS = FAIL = 0
 
@@ -113,7 +113,7 @@ def run_tests(small=False):
         _, data = q2_srv.get()
         check("Channel send/recv 32B", data == b"A" * 32)
 
-    # -- wrap_socket + connect_retry -------------
+    # -- Channel(sock=...) + Channel(retry_timeout=...) --
     if not small:
         port3 = _find_free_port()
         q3 = mp.Queue()
@@ -126,18 +126,18 @@ def run_tests(small=False):
                 srv_sock.listen(1)
                 q3.put(('listening', port3))
                 conn, _ = srv_sock.accept()
-                handle = wrap_socket(conn)
+                ch = Channel(sock=conn)
                 # Verify fd was transferred (socket should be closed)
                 try: conn.fileno()
                 except OSError: pass  # Expected
-                q3.put(('ok', isinstance(handle, int)))
+                q3.put(('ok', ch is not None))
             except Exception as e:
                 q3.put(('err', str(e)))
 
         def cli3_worker():
             try:
-                s = connect_retry("127.0.0.1", port3)
-                q3.put(('ok', s is not None))
+                ch = Channel("127.0.0.1", port3, retry_timeout=10)
+                q3.put(('ok', ch is not None))
             except Exception as e:
                 q3.put(('err', str(e)))
 
@@ -155,7 +155,8 @@ def run_tests(small=False):
         while not q3.empty():
             results.append(q3.get())
         ok_count = sum(1 for r in results if r[0] == 'ok')
-        check("wrap_socket + connect_retry", ok_count >= 2, f"got {ok_count}/2 ok")
+        check("Channel(sock=) + Channel(retry_timeout=)", ok_count >= 2,
+              f"got {ok_count}/2 ok")
 
     # -- _from_ptr ------------------------------
     try:
