@@ -3,7 +3,6 @@ Tree Cache
 @author  mincy
 """
 
-import inspect
 import json
 import os
 
@@ -11,49 +10,6 @@ import mpmt
 import secrets
 from pathlib import Path
 
-def _is_valid_merge_fn(merge_fn: object) -> bool:
-    if not callable(merge_fn):
-        return False
-
-    try:
-        signature = inspect.signature(merge_fn)
-    except (TypeError, ValueError):
-        return False
-
-    parameters = tuple(signature.parameters.values())
-    expected_names = ("sva", "svb", "svout")
-
-    if len(parameters) != len(expected_names):
-        return False
-
-    return all(
-        parameter.name == expected_name
-        and parameter.kind is inspect.Parameter.KEYWORD_ONLY
-        and parameter.default is inspect.Parameter.empty
-        for parameter, expected_name in zip(parameters, expected_names)
-    )
-
-def _is_valid_ring_conv(ring_conv_fn: object) -> bool:
-    if not callable(ring_conv_fn):
-        return False
-
-    try:
-        signature = inspect.signature(ring_conv_fn)
-    except (TypeError, ValueError):
-        return False
-
-    parameters = tuple(signature.parameters.values())
-    expected_names = ("sv", "sv_out", "ell_to")
-
-    if len(parameters) != len(expected_names):
-        return False
-
-    return all(
-        parameter.name == expected_name
-        and parameter.kind is inspect.Parameter.KEYWORD_ONLY
-        and parameter.default is inspect.Parameter.empty
-        for parameter, expected_name in zip(parameters, expected_names)
-    )
 
 class _TreeCache:
     def __init__(
@@ -65,16 +21,6 @@ class _TreeCache:
         merge_fn,
         ring_conv_fn
     ):
-        if not _is_valid_merge_fn(merge_fn):
-            raise TypeError(
-                "merge_fn must have signature (*, sva, svb, svout)"
-            )
-
-        if not _is_valid_ring_conv(ring_conv_fn):
-            raise TypeError(
-                "ring_conv_fn must have signature (*, sv, sv_out, ell_to)"
-            )
-
         self._merge = merge_fn
         self._ring_conv = ring_conv_fn
 

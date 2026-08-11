@@ -4,6 +4,8 @@
 """
 
 import math
+import mpmt
+from array import array
 
 _BF_SET_SIZE_MIN     = 2 ** 10  # minimum allowed set size
 _BF_SET_SIZE_MAX     = 2 ** 25  # maximum allowed set size
@@ -62,6 +64,38 @@ def bf_param(set_size: int, fpr_mantissa: float, fpr_exponent: int):
     hf_num_log2up = math.floor(math.log2(hf_num)) + 1
 
     return bf_size, bf_size_log2up, hf_num, hf_num_log2up
+
+def gen_bf(
+    self, *,
+    ell: int,
+    set: list[bytes],
+    hash_seed_list: list[bytes]
+):        
+    Rv = mpmt.Rvector(ell=ell)
+    bf = Rv(self._bf_size)
+    bf.fill(0)
+    batch_size = min(
+        2 ** 20,
+        max(2 ** 18, self._bf_size // 128),
+    )
+
+    batch_cap = batch_size * self._hf_num
+    batch_idx = array("Q", [0]) * batch_cap
+    pos = 0
+    for e in set:
+        for hs in hash_seed_list:
+            batch_idx[pos] = mpmt.ring_mod(
+                self._ell_add2,
+                mpmt.hash_aes_dm(preimage=e, key=hs, ell=self._ell_add2),
+                self._bf_size,
+            )
+            pos += 1
+        if pos >= batch_cap:
+            bf.batch_set(indices=batch_idx, val=1)
+            pos = 0
+    if pos > 0:
+        bf.batch_set(indices=batch_idx[:pos], val=1)
+    return bf
 
 
 #  ──────────────────────────────────────────────────────────────────────────────────────────────────────

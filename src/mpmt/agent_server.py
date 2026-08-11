@@ -70,36 +70,31 @@ class AgentServer:
         self._ch_prev = ch_prev
         self._ch_nxt  = ch_nxt
         self._rep3_inst_ell1 = mpmt.ShrRep3(
-            ell=1, 
-            party=int(self._server_role)
-        )(self._ch_prev, self._ch_nxt)
-
-        self._rep3_inst_ell_add2 = mpmt.ShrRep3(
-            ell=self._ell_add2, 
+            ell=1,
             party=int(self._server_role)
         )(self._ch_prev, self._ch_nxt)
 
         self._rep3_inst_ell_root = mpmt.ShrRep3(
-            ell=self._ell_root, 
+            ell=self._ell_root,
             party=int(self._server_role)
         )(self._ch_prev, self._ch_nxt)
 
         if self._server_role == ServerRole.STEWARD:
             self._server_dpf_inst = mpmt.DpfDealer(
-                ell_in=self._ell_add2, 
+                ell_in=self._ell_add2,
                 ell_out=self._ell_root
             )(self._ch_nxt, self._ch_prev)
 
         elif self._server_role == ServerRole.PEER0:
             self._server_dpf_inst = mpmt.DpfEvaluator(
-                ell_in=self._ell_add2, 
+                ell_in=self._ell_add2,
                 ell_out=self._ell_root,
                 party=0
             )(self._ch_prev)
 
         elif self._server_role == ServerRole.PEER1:
             self._server_dpf_inst = mpmt.DpfEvaluator(
-                ell_in=self._ell_add2, 
+                ell_in=self._ell_add2,
                 ell_out=self._ell_root,
                 party=1
             )(self._ch_nxt)
@@ -128,7 +123,7 @@ class AgentServer:
             self._pack_buf,
             svout
         )
-            
+
     @overload
     def response_share_bf(
         self,
@@ -257,6 +252,25 @@ class AgentServer:
         self, *,
         ch_querier: mpmt.channels.Channel,
     ) -> None:
+        _rt_inst_for_idx_prev = mpmt.RingTransport(ell=self._ell_add2)(self._ch_prev)
+        _rt_inst_for_idx_nxt = mpmt.RingTransport(ell=self._ell_add2)(self._ch_nxt)
+        def _reshare_idx_share(val: int):
+            ss = mpmt.ShrRep3ShareScalar()
+            ss.this_share = val
+            if self._server_role == ServerRole.STEWARD:
+                _rt_inst_for_idx_prev.send_scalar(val)
+                ss.nxt_share = _rt_inst_for_idx_nxt.recv_scalar()
+                
+            elif self._server_role == ServerRole.PEER0:
+                _rt_inst_for_idx_prev.send_scalar(val)
+                ss.nxt_share = _rt_inst_for_idx_nxt.recv_scalar()
+
+            elif self._server_role == ServerRole.PEER1:
+                ss.nxt_share = _rt_inst_for_idx_nxt.recv_scalar()
+                _rt_inst_for_idx_prev.send_scalar(val)
+
+            return ss
+
         if self._server_role == ServerRole.STEWARD:
             add2_inst = mpmt.ShrAdd2(ell=self._ell_add2, party=1)(ch_querier)
             element_share = add2_inst.recv_element_share()
@@ -270,7 +284,7 @@ class AgentServer:
 
             alpha_set = []
             for ishare in idx_shares:
-                idx_rep_share = self._rep3_inst_ell_add2.reshare_scalar(val=ishare)
+                idx_rep_share = _reshare_idx_share(val=ishare)
                 alpha = mpmt.ring_add(
                             ell=self._ell_add2, 
                             a=idx_rep_share.this_share, 
@@ -331,7 +345,7 @@ class AgentServer:
 
             bias_set = []
             for ishare in idx_shares:  
-                idx_rep_share = self._rep3_inst_ell_add2.reshare_scalar(val=ishare)
+                idx_rep_share = _reshare_idx_share(val=ishare)
                 if self._server_role == ServerRole.PEER0:
                     bias_set.append(idx_rep_share.nxt_share)
                 elif self._server_role == ServerRole.PEER1:
