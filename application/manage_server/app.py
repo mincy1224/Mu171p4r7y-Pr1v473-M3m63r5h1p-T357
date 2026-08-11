@@ -1,5 +1,6 @@
 # draft
 import json
+import math
 import os
 import socket
 import threading
@@ -7,6 +8,7 @@ import time
 
 from flask import Flask, request, jsonify
 from _c3_io import read_json
+from _c3_task_status import write as write_task_status
 from .db import db
 
 _APP_DIR = os.path.join(os.path.dirname(__file__), "..")
@@ -29,8 +31,7 @@ class AgentManager:
         self._timeout = timeout
         self._conns: dict[str, socket.socket] = {}
         self._bufs: dict[str, bytes] = {}
-        for role in agents_cfg:
-            self._connect(role)
+        # connections are established lazily — call connect_all()
 
     def _connect(self, role: str) -> None:
         """Create a fresh connection to *role*, replacing any old one."""
@@ -46,18 +47,31 @@ class AgentManager:
         s.connect((ac["ip"], ac["mgmt_port"]))
         self._conns[role] = s
         self._bufs[role] = b""
+        print(f"[manage] connected to {role} at {ac['ip']}:{ac['mgmt_port']}", flush=True)
 
     def reconnect(self, role: str) -> None:
         """Public: reconnect a dropped Agent."""
         self._connect(role)
 
+    def settimeout(self, role: str, timeout: float) -> None:
+        """Set socket timeout for *role* (used for per-recv deadline)."""
+        conn = self._conns.get(role)
+        if conn is not None:
+            conn.settimeout(timeout)
+
     def send(self, role: str, msg: dict) -> None:
-        self._conns[role].sendall(json.dumps(msg).encode() + b"\n")
+        conn = self._conns.get(role)
+        if conn is None:
+            raise ConnectionError(f"{role} not connected")
+        conn.sendall(json.dumps(msg).encode() + b"\n")
 
     def recv(self, role: str) -> dict:
+        conn = self._conns.get(role)
+        if conn is None:
+            raise ConnectionError(f"{role} not connected")
         buf = self._bufs[role]
         while b"\n" not in buf:
-            chunk = self._conns[role].recv(4096)
+            chunk = conn.recv(4096)
             if not chunk:
                 raise ConnectionError(f"{role} disconnected")
             buf += chunk
@@ -72,15 +86,29 @@ class C3ManageServer:
         cfg = read_json(os.path.join(_dir, "..", "config.json"))
         self._cfg = cfg["manage_server"]
         self._timeout = cfg["timeout"]
+        self._queue_lease_timeout = cfg.get("queue_lease_timeout", 120)
+
+        print("[manage] Manager starting up ...", flush=True)
 
         # seed users from pretreat into DB
         pretreat_dir = os.path.join(_dir, "..", "pretreat")
         db.seed_users(pretreat_dir)
+        print("[manage] DB seeded from pretreat", flush=True)
 
         # reconcile ACTIVE/BUSY operations left over from a previous crash
-        reconciled = db.reconcile_on_startup()
-        if reconciled:
-            print(f"[manage] reconciled {reconciled} stale operation(s) → FAILED")
+        result = db.reconcile_on_startup()
+        if result["count"]:
+            print(f"[manage] reconciled {result['count']} stale operation(s) → FAILED", flush=True)
+        if result["uncertain"]:
+            write_task_status(
+                "cracked",
+                "Manager restarted while a BUSY operation existed — "
+                "EXECUTE was already in flight, protocol state uncertain",
+            )
+            raise RuntimeError(
+                "Uncertain protocol state after restart: BUSY operation found. "
+                "Stop all C3 processes, run pretreat, then restart all components."
+            )
 
         self._agents = AgentManager({
             "STEWARD": {"ip": cfg["steward"]["ip"],
@@ -96,11 +124,46 @@ class C3ManageServer:
         self._agent_ips = {r: cfg[r]["ip"]
                           for r in ("steward", "peer0", "peer1")}
         self._lock = threading.Lock()
+        self._task_cracked = False
+        self._agents_available = True
         self._app = self._create_app()
 
     def _next_request_id(self) -> str:
         self._req_counter += 1
         return f"r{self._req_counter}"
+
+    def _reconnect_all(self) -> bool:
+        """Reconnect all agents. Returns True iff all three succeeded.
+        Updates _agents_available to reflect current connectivity."""
+        ok = True
+        for role in ("STEWARD", "PEER0", "PEER1"):
+            try:
+                self._agents.reconnect(role)
+            except Exception as e:
+                ok = False
+                print(f"[manage] reconnect {role} failed: {e}")
+        self._agents_available = ok
+        return ok
+
+    def _crack_task(self, op_id: int, error_code: str, info: str = "") -> None:
+        """Halt the entire task: agents uncertain, task unrecoverable.
+        Order: block new ops FIRST, then record, then best-effort cleanup.
+        No self-recovery — cracked requires full process restart + pretreat."""
+        with self._lock:
+            self._task_cracked = True
+        try:
+            db.fail_operation(op_id, error_code)
+        except Exception as e:
+            print(f"[manage] fail_operation error: {e}")
+        try:
+            write_task_status("cracked", info or f"{error_code}: op_id={op_id}")
+        except Exception as e:
+            print(f"[manage] write_task_status error: {e}")
+        try:
+            db.fail_all_live_operations("TASK_CRACKED")
+        except Exception as e:
+            print(f"[manage] fail_all_live_operations error: {e}")
+        self._ports.clear()
 
     # Flask app
 
@@ -112,6 +175,12 @@ class C3ManageServer:
 
         @app.route("/reserve_join", methods=["POST"])
         def reserve_join():
+            if self._task_cracked:
+                return jsonify({"status": "FAILED",
+                                "reason": "TASK_CRACKED"}), 503
+            if not self._agents_available:
+                return jsonify({"status": "FAILED",
+                                "reason": "AGENT_UNAVAILABLE"}), 503
             data = request.get_json(silent=True) or {}
             user_id = data.get("user_id")
             if not user_id:
@@ -125,16 +194,32 @@ class C3ManageServer:
                 return jsonify({"status": "REJECTED",
                                 "reason": "already joined"})
             with self._lock:
+                if self._task_cracked:
+                    return jsonify({"status": "FAILED",
+                                    "reason": "TASK_CRACKED"}), 503
+                if not self._agents_available:
+                    return jsonify({"status": "FAILED",
+                                    "reason": "AGENT_UNAVAILABLE"}), 503
                 active = db.get_active_operation_by_user(user_id)
                 if active:
-                    return jsonify({"status": "ALREADY",
-                                    "op_id": active["op_id"]})
+                    if active["prot_type"] == "JOIN":
+                        return jsonify({"status": "ALREADY",
+                                        "op_id": active["op_id"]})
+                    else:
+                        return jsonify({"status": "CONFLICT",
+                                        "reason": f"user has active {active['prot_type']} operation"}), 409
                 pos = db.next_queue_pos()
                 op_id = db.create_operation(user_id, "JOIN", pos)
             return jsonify({"status": "SUCCESSFUL", "op_id": op_id})
 
         @app.route("/reserve_update", methods=["POST"])
         def reserve_update():
+            if self._task_cracked:
+                return jsonify({"status": "FAILED",
+                                "reason": "TASK_CRACKED"}), 503
+            if not self._agents_available:
+                return jsonify({"status": "FAILED",
+                                "reason": "AGENT_UNAVAILABLE"}), 503
             data = request.get_json(silent=True) or {}
             user_id = data.get("user_id")
             if not user_id:
@@ -148,16 +233,32 @@ class C3ManageServer:
                 return jsonify({"status": "REJECTED",
                                 "reason": "not joined yet"})
             with self._lock:
+                if self._task_cracked:
+                    return jsonify({"status": "FAILED",
+                                    "reason": "TASK_CRACKED"}), 503
+                if not self._agents_available:
+                    return jsonify({"status": "FAILED",
+                                    "reason": "AGENT_UNAVAILABLE"}), 503
                 active = db.get_active_operation_by_user(user_id)
                 if active:
-                    return jsonify({"status": "ALREADY",
-                                    "op_id": active["op_id"]})
+                    if active["prot_type"] == "UPDATE":
+                        return jsonify({"status": "ALREADY",
+                                        "op_id": active["op_id"]})
+                    else:
+                        return jsonify({"status": "CONFLICT",
+                                        "reason": f"user has active {active['prot_type']} operation"}), 409
                 pos = db.next_queue_pos()
                 op_id = db.create_operation(user_id, "UPDATE", pos)
             return jsonify({"status": "SUCCESSFUL", "op_id": op_id})
 
         @app.route("/reserve_query", methods=["POST"])
         def reserve_query():
+            if self._task_cracked:
+                return jsonify({"status": "FAILED",
+                                "reason": "TASK_CRACKED"}), 503
+            if not self._agents_available:
+                return jsonify({"status": "FAILED",
+                                "reason": "AGENT_UNAVAILABLE"}), 503
             data = request.get_json(silent=True) or {}
             user_id = data.get("user_id")
             if not user_id:
@@ -166,16 +267,32 @@ class C3ManageServer:
                 return jsonify({"status": "REJECTED",
                                 "reason": "unknown user_id"})
             with self._lock:
+                if self._task_cracked:
+                    return jsonify({"status": "FAILED",
+                                    "reason": "TASK_CRACKED"}), 503
+                if not self._agents_available:
+                    return jsonify({"status": "FAILED",
+                                    "reason": "AGENT_UNAVAILABLE"}), 503
                 active = db.get_active_operation_by_user(user_id)
                 if active:
-                    return jsonify({"status": "ALREADY",
-                                    "op_id": active["op_id"]})
+                    if active["prot_type"] == "QUERY":
+                        return jsonify({"status": "ALREADY",
+                                        "op_id": active["op_id"]})
+                    else:
+                        return jsonify({"status": "CONFLICT",
+                                        "reason": f"user has active {active['prot_type']} operation"}), 409
                 pos = db.next_queue_pos()
                 op_id = db.create_operation(user_id, "QUERY", pos)
             return jsonify({"status": "SUCCESSFUL", "op_id": op_id})
 
         @app.route("/reserve_quit", methods=["POST"])
         def reserve_quit():
+            if self._task_cracked:
+                return jsonify({"status": "FAILED",
+                                "reason": "TASK_CRACKED"}), 503
+            if not self._agents_available:
+                return jsonify({"status": "FAILED",
+                                "reason": "AGENT_UNAVAILABLE"}), 503
             data = request.get_json(silent=True) or {}
             user_id = data.get("user_id")
             if not user_id:
@@ -189,10 +306,20 @@ class C3ManageServer:
                 return jsonify({"status": "REJECTED",
                                 "reason": "not joined yet"})
             with self._lock:
+                if self._task_cracked:
+                    return jsonify({"status": "FAILED",
+                                    "reason": "TASK_CRACKED"}), 503
+                if not self._agents_available:
+                    return jsonify({"status": "FAILED",
+                                    "reason": "AGENT_UNAVAILABLE"}), 503
                 active = db.get_active_operation_by_user(user_id)
                 if active:
-                    return jsonify({"status": "ALREADY",
-                                    "op_id": active["op_id"]})
+                    if active["prot_type"] == "QUIT":
+                        return jsonify({"status": "ALREADY",
+                                        "op_id": active["op_id"]})
+                    else:
+                        return jsonify({"status": "CONFLICT",
+                                        "reason": f"user has active {active['prot_type']} operation"}), 409
                 pos = db.next_queue_pos()
                 op_id = db.create_operation(user_id, "QUIT", pos)
             return jsonify({"status": "SUCCESSFUL", "op_id": op_id})
@@ -222,6 +349,7 @@ class C3ManageServer:
                 return jsonify({"status": "REJECTED",
                                 "reason": "unauthorized"})
 
+            # terminal states always take priority — preserve original error code
             status = op["status"]
             if status == "DONE":
                 return jsonify({"status": "DONE"})
@@ -231,19 +359,41 @@ class C3ManageServer:
             if status == "REMOVED":
                 return jsonify({"status": "REMOVED"})
 
+            # only non-terminal work is blocked by crack
+            if self._task_cracked:
+                return jsonify({"status": "FAILED",
+                                "reason": "TASK_CRACKED"}), 503
+            if not self._agents_available:
+                return jsonify({"status": "FAILED",
+                                "reason": "AGENT_UNAVAILABLE"}), 503
+
             with self._lock:
+                if self._task_cracked:
+                    return jsonify({"status": "FAILED",
+                                    "reason": "TASK_CRACKED"}), 503
+                if not self._agents_available:
+                    return jsonify({"status": "FAILED",
+                                    "reason": "AGENT_UNAVAILABLE"}), 503
                 op = db.get_operation(op_id)
                 status = op["status"]
 
                 if status == "QUEUED":
-                    self._try_advance_queue()
-                    op = db.get_operation(op_id)
-                    if op["status"] == "ACTIVE":
-                        return self._start_execute(op)
+                    db.touch_operation(op_id)  # client heartbeat
+                    activated = self._try_activate(op_id)
+                    if activated:
+                        op = db.get_operation(op_id)
+                        if op["status"] == "ACTIVE":
+                            return self._start_execute(op)
                     pos = db.queue_position_of(op_id)
+
+                    active_op = db.get_active()
+                    ahead = (pos - 1 if pos else 0) + (1 if active_op else 0)
+                    retry_after = min(8.0, max(1.0, 1.5 * math.sqrt(ahead + 1)))
+
                     return jsonify({"status": "WAITING",
                                     "position": pos,
-                                    "remaining": pos - 1 if pos else 0})
+                                    "ahead": ahead,
+                                    "retry_after": round(retry_after, 1)})
 
                 if status == "ACTIVE":
                     return self._start_execute(op)
@@ -310,6 +460,12 @@ class C3ManageServer:
 
     def _reserve_ports(self, op_id: int, user_id: str, prot_type: str
                        ) -> dict[str, int] | None:
+        # reset socket timeouts (previous op may have shrunk them for deadline)
+        for role in ("STEWARD", "PEER0", "PEER1"):
+            try:
+                self._agents.settimeout(role, self._timeout)
+            except Exception:
+                pass
         req_id = self._next_request_id()
         try:
             for role in ("STEWARD", "PEER0", "PEER1"):
@@ -318,6 +474,7 @@ class C3ManageServer:
                                          "user_id": user_id,
                                          "prot_type": prot_type})
         except (OSError, ConnectionError):
+            self._reconnect_all()
             return None
 
         ports: dict[str, int] = {}
@@ -330,6 +487,10 @@ class C3ManageServer:
                     ack = self._agents.recv(role)
                 except (ConnectionError, socket.timeout):
                     failed = True
+                    try:
+                        self._agents.reconnect(role)
+                    except Exception:
+                        pass
                     break
                 if ack.get("request_id") == req_id:
                     break
@@ -353,6 +514,10 @@ class C3ManageServer:
                 resp = self._agents.recv(role)
             except (ConnectionError, socket.timeout):
                 failed = True
+                try:
+                    self._agents.reconnect(role)
+                except Exception:
+                    pass
                 continue
             if (resp.get("event") != "RESERVED"
                     or resp.get("request_id") != req_id):
@@ -361,6 +526,7 @@ class C3ManageServer:
             ports[role] = resp["port"]
 
         if failed:
+            self._reconnect_all()
             return None
         return ports
 
@@ -368,7 +534,19 @@ class C3ManageServer:
         req_id = self._next_request_id()
         deadline = time.monotonic() + self._timeout
 
-        # --- send EXECUTE to all three (with per-agent token for UPDATE/QUIT) ---
+        # --- preflight: verify all tokens present for UPDATE/QUIT ---
+        agent_tokens: dict[str, str] = {}
+        if prot_type in ("UPDATE", "QUIT"):
+            for role in ("STEWARD", "PEER0", "PEER1"):
+                tok = db.get_agent_token(user_id, role)
+                if not tok:
+                    self._ports.pop(op_id, None)
+                    db.fail_operation(op_id, f"MISSING_TOKEN_{role}")
+                    return
+                agent_tokens[role] = tok
+
+        # --- send EXECUTE to all three ---
+        # Once EXECUTE is sent, any failure here is UNCERTAIN → cracked.
         try:
             for role in ("STEWARD", "PEER0", "PEER1"):
                 msg = {"request_id": req_id,
@@ -376,24 +554,31 @@ class C3ManageServer:
                        "user_id": user_id,
                        "prot_type": prot_type}
                 if prot_type in ("UPDATE", "QUIT"):
-                    tok = db.get_agent_token(user_id, role)
-                    if tok:
-                        msg["token"] = tok
+                    msg["token"] = agent_tokens[role]
                 self._agents.send(role, msg)
         except (OSError, ConnectionError):
-            self._ports.pop(op_id, None)
-            db.fail_operation(op_id, "AGENT_DISCONNECTED")
+            self._crack_task(op_id, "AGENT_DISCONNECTED",
+                f"EXECUTE dispatch uncertain: op={op_id} user={user_id}")
             return
 
-        # --- collect READY acks ---
+        # --- collect READY acks (per-recv deadline timeout) ---
         ready_ok = True
         for role in ("STEWARD", "PEER0", "PEER1"):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                ready_ok = False
+                break
+            self._agents.settimeout(role, min(self._timeout, max(0.1, remaining)))
             ack = None
             for _ in range(self._MAX_SKIP):
                 try:
                     ack = self._agents.recv(role)
                 except (ConnectionError, socket.timeout):
                     ready_ok = False
+                    try:
+                        self._agents.reconnect(role)
+                    except Exception:
+                        pass
                     break
                 if ack.get("request_id") == req_id:
                     break
@@ -406,23 +591,29 @@ class C3ManageServer:
                 break
 
         if not ready_ok:
-            self._ports.pop(op_id, None)
-            db.fail_operation(op_id, "EXECUTE_READY_FAILED")
+            self._crack_task(op_id, "EXECUTE_READY_FAILED",
+                f"READY not received from all agents: op={op_id}")
             return
 
-        # --- collect terminal events from all three agents ---
+        # --- collect terminal events from all three agents (per-recv deadline) ---
         tokens: dict[str, str] = {}
         all_done = True
         for role in ("STEWARD", "PEER0", "PEER1"):
-            if time.monotonic() > deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 all_done = False
                 break
+            self._agents.settimeout(role, min(self._timeout, max(0.1, remaining)))
             event = None
             for _ in range(self._MAX_SKIP):
                 try:
                     event = self._agents.recv(role)
                 except (ConnectionError, socket.timeout):
                     all_done = False
+                    try:
+                        self._agents.reconnect(role)
+                    except Exception:
+                        pass
                     break
                 if event.get("request_id") == req_id:
                     break
@@ -438,37 +629,84 @@ class C3ManageServer:
                 tokens[role] = tok
 
         if not all_done:
-            self._ports.pop(op_id, None)
-            db.fail_operation(op_id, "PROTOCOL_FAILED")
+            self._crack_task(op_id, "PROTOCOL_FAILED",
+                f"{prot_type} protocol incomplete: op={op_id} user={user_id}")
             return
 
         # --- success: update DB atomically ---
         self._ports.pop(op_id, None)
         if prot_type == "JOIN":
-            db.complete_join(op_id, user_id, tokens)
+            if set(tokens.keys()) != {"STEWARD", "PEER0", "PEER1"}:
+                self._crack_task(op_id, "INCOMPLETE_TOKENS",
+                    f"JOIN op_id={op_id} user={user_id} "
+                    f"got tokens from {sorted(tokens.keys())}")
+                return
+            try:
+                db.complete_join(op_id, user_id, tokens)
+            except Exception as e:
+                self._crack_task(op_id, "DB_COMMIT_FAILED",
+                    f"JOIN DB commit failed: op={op_id}: {e}")
         elif prot_type == "QUIT":
-            db.complete_quit(op_id, user_id)
+            try:
+                db.complete_quit(op_id, user_id)
+            except Exception as e:
+                self._crack_task(op_id, "DB_COMMIT_FAILED",
+                    f"QUIT DB commit failed: op={op_id}: {e}")
         else:
-            db.update_operation(op_id, "DONE", queue_pos=None)
+            try:
+                db.update_operation(op_id, "DONE", queue_pos=None)
+            except Exception as e:
+                self._crack_task(op_id, "DB_COMMIT_FAILED",
+                    f"{prot_type} completed on agents but DB update failed: {e}")
 
     # queue
 
-    def _handle_overtime(self, op_id: int):
-        """Mark an operation FAILED after timeout.
-        No automatic requeue — the old Agent protocol thread cannot be
-        safely cancelled, so retrying would risk double execution."""
-        self._ports.pop(op_id, None)
-        db.fail_operation(op_id, "AGENT_TIMEOUT")
+    def _evict_stale_queue_heads(self):
+        """Remove QUEUED ops whose lease has expired (dead client at head)."""
+        now_ts = time.time()
+        while True:
+            first = db.first_queued()
+            if first is None:
+                return
+            try:
+                updated_ts = time.mktime(
+                    time.strptime(first["updated_at"], "%Y-%m-%dT%H:%M:%S"))
+            except (ValueError, OverflowError):
+                break
+            if now_ts - updated_ts > self._queue_lease_timeout:
+                db.remove_from_queue(first["op_id"])
+                continue
+            break
 
-    def _try_advance_queue(self):
-        if db.get_active() is None:
-            db.promote_first_queued()
+    def _try_activate(self, op_id: int) -> bool:
+        """Promote *op_id* QUEUED → ACTIVE only if it is at the head of the queue
+        and no other operation is ACTIVE/BUSY.  Returns True on success."""
+        if self._task_cracked:
+            return False
+        if db.get_active() is not None:
+            return False
+        self._evict_stale_queue_heads()
+        first = db.first_queued()
+        if first is None:
+            return False
+        if first["op_id"] != op_id:
+            return False
+        db.promote_first_queued()
+        return True
 
     # run
 
     def run(self):
-        self._app.run(host=self._cfg["server_ip"],
-                      port=self._cfg["http_port"], debug=False)
+        print(f"[manage] trying to connect to agents ...", flush=True)
+        self._reconnect_all()
+        if self._agents_available:
+            print("[manage] all agents connected", flush=True)
+        else:
+            print("[manage] WARNING: some agents are not reachable — "
+                  "requests will get AGENT_UNAVAILABLE until agents start", flush=True)
+        print(f"[manage] listening on http://{self._cfg['server_ip']}:{self._cfg['http_port']}", flush=True)
+        self._app.run(host=self._cfg['server_ip'],
+                      port=self._cfg['http_port'], debug=False)
 
 
 def run():

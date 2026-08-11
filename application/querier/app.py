@@ -2,6 +2,7 @@
 import json
 import os
 import time
+import urllib.error
 import urllib.request
 
 import mpmt
@@ -37,8 +38,14 @@ class C3Querier:
         data = json.dumps(body).encode()
         req = urllib.request.Request(url, data=data,
                                      headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-            return json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            try:
+                return json.loads(e.read())
+            except json.JSONDecodeError:
+                return {"status": "FAILED", "reason": f"http_{e.code}"}
 
     # protocol
     def run_protocol(self, agents: dict) -> int:
@@ -64,6 +71,8 @@ class C3Querier:
         resp = self._post("/reserve_query", {"user_id": self._user_id})
         if resp.get("status") == "REJECTED":
             return resp
+        if resp.get("status") == "CONFLICT":
+            return resp
         if resp.get("status") not in ("SUCCESSFUL", "ALREADY"):
             return resp
         op_id = resp.get("op_id")
@@ -82,11 +91,29 @@ class C3Querier:
             if status in ("REMOVED", "FAILED", "NOT_FOUND"):
                 return resp
             if status == "WAITING":
-                time.sleep(1)
+                ahead = resp.get("ahead", 0)
+                delay = float(resp.get("retry_after", 1.0))
+
+                print(f"\r[query] server: {ahead} task(s) ahead "
+                      f"— retrying in {delay:.1f}s",
+                      end="", flush=True)
+
+                end = time.monotonic() + delay
+                while time.monotonic() < end:
+                    remaining = end - time.monotonic()
+                    print(f"\r[query] server: {ahead} task(s) ahead "
+                          f"— retrying in {remaining:.1f}s",
+                          end="", flush=True)
+                    time.sleep(min(0.1, remaining))
+
+                print("\r[query] contacting server..."
+                      + " " * 30, end="", flush=True)
                 continue
             if status == "BUSY":
                 if not protocol_started:
                     protocol_started = True
+                    print("\r[query] executing query protocol..."
+                          + " " * 30)
                     result = self.run_protocol(resp["agents"])
                 time.sleep(1)
                 continue

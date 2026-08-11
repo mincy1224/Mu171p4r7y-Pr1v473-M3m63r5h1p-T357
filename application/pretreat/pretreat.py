@@ -23,12 +23,13 @@ import mpmt
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from _c3_io import ensure_dir, read_json
+from _c3_task_status import read as read_task_status, write as write_task_status
 
-FPR_EXPONENT    = -7          # false-positive rate exponent
-FPR_MANTISSA    = 3           # false-positive rate mantissa
+FPR_EXPONENT    = -3          # false-positive rate exponent
+FPR_MANTISSA    = 1           # false-positive rate mantissa
 SET_SIZE        = 1_000_000   # expected set size
 PAYLOAD_PERCENT = 0.8         # actual payload ratio: real set = set_size * payload_percent
-SET_HOLDER_NUM  = 3           # number of set holders
+SET_HOLDER_NUM  = 8          # number of set holders
 QUERIER_NUM     = 2           # number of queriers
 
 def _c3_make_user_id() -> str:
@@ -88,7 +89,15 @@ def _c3_clean_pretreat(pretreatment_dir: str, storage_dir: str) -> None:
             os.remove(path)
 
 
-def generate() -> None:
+def generate(force: bool = False) -> None:
+    # safety: refuse to overwrite a running task unless --force
+    s = read_task_status()
+    if s and s["status"] == "active" and not force:
+        print("[pretreat] ERROR: task is active — processes may still be running.")
+        print("[pretreat] Stop all C3 processes first, then re-run with --force.")
+        sys.exit(1)
+
+    write_task_status("unprepared", "pretreatment in progress")
     pretreatment_dir = os.path.dirname(os.path.abspath(__file__))
     app_dir = os.path.dirname(pretreatment_dir)
     storage_root = read_json(os.path.join(app_dir, "config.json"))["storage_root_dir"]
@@ -97,7 +106,7 @@ def generate() -> None:
     # 1. clean — WARNING: this deletes all previous protocol state,
     # including Agent storage, SQLite DB, and user datasets.
     # Only run this in a test/benchmark environment.
-    print("[pretreat] WARNING: cleaning all storage except download/ ...")
+    print("[pretreat] WARNING: removing protocol-created directories (manage/agent/set_holder) ...")
     _c3_clean_pretreat(pretreatment_dir, storage_dir)
 
     # 2. compute hash-function count
@@ -148,18 +157,32 @@ def generate() -> None:
     _c3_split_and_save(full_set, list(set_holder_users.keys()), storage_dir)
     print(f"[dataset]       {actual_size} elements split across {SET_HOLDER_NUM} holders")
 
+    write_task_status("active")
+    print("[task_status]   written status=active")
+
 
 def run_cli(args: list[str] | None = None) -> None:
     pretreatment_dir = os.path.dirname(os.path.abspath(__file__))
     app_dir = os.path.dirname(pretreatment_dir)
     storage_root = read_json(os.path.join(app_dir, "config.json"))["storage_root_dir"]
     storage_dir = os.path.join(app_dir, storage_root)
-    if args and "--onlyclr" in args:
-        print("[onlyclr] WARNING: cleaning all storage except download/ ...")
+
+    if args is None:
+        args = []
+    force = "--force" in args
+
+    if "--onlyclr" in args:
+        s = read_task_status()
+        if s and s["status"] == "active" and not force:
+            print("[pretreat] ERROR: task is active — processes may still be running.")
+            print("[pretreat] Stop all C3 processes first, then re-run with --force.")
+            sys.exit(1)
+        write_task_status("unprepared", "protocol storage was cleared; pretreat required")
+        print("[onlyclr] WARNING: removing protocol-created directories (manage/agent/set_holder) ...")
         _c3_clean_pretreat(pretreatment_dir, storage_dir)
         print("[onlyclr] done")
     else:
-        generate()
+        generate(force=force)
 
 
 if __name__ == "__main__":
