@@ -242,12 +242,12 @@ def run_tests(small=False):
     from mpmt.channels import Channel
     a0, b0 = _socket.socketpair()
     a1, b1 = _socket.socketpair()
-    ch_e0 = Channel(sock=a0)
-    ch_e1 = Channel(sock=a1)
+    ch_e0 = Channel(a0)
+    ch_e1 = Channel(a1)
     d = mpmt.DpfDealer(13, 2)(ch_e0, ch_e1)
     k0, k1 = d.gen(0, 1)
     EC = mpmt.DpfEvaluator(13, 2, 0)
-    ev = EC(Channel(sock=b0))
+    ev = EC(Channel(b0))
     Rv = mpmt.Rvector(2)
     buf = Rv(1 << 13)
     try:

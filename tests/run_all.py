@@ -485,11 +485,12 @@ from building_blocks.test_emp2.test_protocol import run_tests as run_emp2_proto
 from building_blocks.test_emp2.test_factory import run_tests as run_emp2_fact
 from building_blocks.test_dpf.test_operations import run_tests as run_dpf_ops
 from building_blocks.test_dpf.test_basic import run_tests as run_dpf_basic
+from integration.test_rep3_tcp_ring import run_tests as run_rep3_ring
 
 for _mod in [run_util, run_sharevec, run_channels, run_ring_transport,
              run_aby3_ops, run_aby3_proto, run_aby3_fact, run_aby3_comp,
              run_emp2_ops, run_emp2_proto, run_emp2_fact,
-             run_dpf_ops, run_dpf_basic]:
+             run_dpf_ops, run_dpf_basic, run_rep3_ring]:
     p, f = _mod(small=args.small)
     PASS += p; FAIL += f
 

@@ -1,8 +1,8 @@
-"""Channel: construction, send/recv, acquire, multi-process startup."""
-import sys, os, time, random, socket, multiprocessing as mp
+"""Channel: construction via socket, send/recv, acquire, connect/listener."""
+import sys, os, time, socket, multiprocessing as mp
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 import mpmt
-from mpmt.channels import Channel
+from mpmt.channels import Channel, ChannelListener
 
 PASS = FAIL = 0
 
@@ -16,11 +16,14 @@ def _find_free_port():
         s.bind(('127.0.0.1', 0))
         return s.getsockname()[1]
 
-def _server_worker(port, q):
+
+def _srv_listener(port, q):
+    """Server: ChannelListener.accept() → recv → send ack."""
     try:
-        ch = Channel(port)
+        listener = ChannelListener("127.0.0.1", port)
+        q.put(('listening', True))
+        ch = listener.accept()
         q.put(('ok', ch is not None))
-        # Wait for client to send something
         buf = bytearray(16)
         ch.recv(buf)
         ch.send(b"ACK_SERVER_TO_CP")
@@ -28,10 +31,12 @@ def _server_worker(port, q):
     except Exception as e:
         q.put(('err', str(e)))
 
-def _client_worker(host, port, payload, q):
+
+def _cli_connect(host, port, payload, q):
+    """Client: Channel.connect() → send → recv ack."""
     try:
-        time.sleep(0.05)  # Let server bind
-        ch = Channel(host, port)
+        time.sleep(0.05)  # let server bind
+        ch = Channel.connect(host, port)
         q.put(('ok', ch is not None))
         ch.send(payload)
         buf = bytearray(16)
@@ -40,45 +45,48 @@ def _client_worker(host, port, payload, q):
     except Exception as e:
         q.put(('err', str(e)))
 
+
 def run_tests(small=False):
     global PASS, FAIL
     PASS = FAIL = 0
     print("=== Channels ===")
 
-    # -- Channel server + client ------------------
+    # -- ChannelListener + Channel.connect bidir -----
     port = _find_free_port()
     q_srv, q_cli = mp.Queue(), mp.Queue()
     payload = b"HELLO_FROM_CLI_X"  # exactly 16 bytes
 
-    srv = mp.Process(target=_server_worker, args=(port, q_srv))
-    cli = mp.Process(target=_client_worker, args=("127.0.0.1", port, payload, q_cli))
+    srv = mp.Process(target=_srv_listener, args=(port, q_srv))
+    cli = mp.Process(target=_cli_connect, args=("127.0.0.1", port, payload, q_cli))
     srv.start(); cli.start()
     srv.join(timeout=10); cli.join(timeout=10)
     if srv.is_alive(): srv.terminate()
     if cli.is_alive(): cli.terminate()
 
-    srv_ok = not q_srv.empty() and q_srv.get()[0] == 'ok'
+    srv_ok = not q_srv.empty() and q_srv.get()[0] == 'listening'
+    if not q_srv.empty():
+        _, srv_ch_ok = q_srv.get()
+        srv_ok = srv_ok and srv_ch_ok
     cli_ok = not q_cli.empty() and q_cli.get()[0] == 'ok'
-    check("Channel server construct", srv_ok)
-    check("Channel client construct", cli_ok)
+    check("ChannelListener + Channel.connect construct", srv_ok and cli_ok)
 
     if srv_ok and cli_ok:
-        # Server receives payload
         _, srv_recv = q_srv.get()
-        check("Channel server recv", srv_recv[:16] == payload,
+        check("ChannelListener recv", srv_recv[:16] == payload,
               f"got {srv_recv[:16]} exp {payload}")
-        # Client receives ACK
         _, cli_recv = q_cli.get()
-        check("Channel client recv", cli_recv[:16] == b"ACK_SERVER_TO_CP",
+        check("Channel.connect recv", cli_recv[:16] == b"ACK_SERVER_TO_CP",
               f"got {cli_recv[:16]}")
 
-    # -- Channel: send / recv / acquire ----------
+    # -- Channel.send / recv / acquire ---------------
     port2 = _find_free_port()
     q2_srv, q2_cli = mp.Queue(), mp.Queue()
 
     def srv2_worker():
         try:
-            ch = Channel(port2)
+            listener = ChannelListener("127.0.0.1", port2)
+            q2_srv.put(('listening', True))
+            ch = listener.accept()
             handle = ch.acquire()
             q2_srv.put(('ok', isinstance(handle, int)))
             buf = bytearray(32)
@@ -90,7 +98,7 @@ def run_tests(small=False):
     def cli2_worker():
         try:
             time.sleep(0.05)
-            ch = Channel("127.0.0.1", port2)
+            ch = Channel.connect("127.0.0.1", port2)
             handle = ch.acquire()
             q2_cli.put(('ok', isinstance(handle, int)))
             ch.send(b"A" * 32)
@@ -101,116 +109,88 @@ def run_tests(small=False):
 
     s2 = mp.Process(target=srv2_worker)
     c2 = mp.Process(target=cli2_worker)
-    s2.start(); c2.start()
+    s2.start()
+    q2_srv.get(timeout=5)  # wait for listening
+    c2.start()
     s2.join(timeout=10); c2.join(timeout=10)
     if s2.is_alive(): s2.terminate()
     if c2.is_alive(): c2.terminate()
 
-    if not q2_srv.empty() and q2_srv.get()[0] == 'ok':
-        _, is_int = q2_srv.get_nowait() if not q2_srv.empty() else (None, False)
+    if not q2_srv.empty():
+        _, is_int = q2_srv.get()
         check("Channel acquire returns int", is_int is not None)
     if not q2_srv.empty():
         _, data = q2_srv.get()
         check("Channel send/recv 32B", data == b"A" * 32)
 
-    # -- Channel(sock=...) + Channel(retry_timeout=...) --
-    if not small:
-        port3 = _find_free_port()
-        q3 = mp.Queue()
+    # -- Channel(sock) wrapping -----------------------
+    port3 = _find_free_port()
+    q3 = mp.Queue()
 
-        def srv3_worker():
-            try:
-                srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                srv_sock.bind(('127.0.0.1', port3))
-                srv_sock.listen(1)
-                q3.put(('listening', port3))
-                conn, _ = srv_sock.accept()
-                ch = Channel(sock=conn)
-                # Verify fd was transferred (socket should be closed)
-                try: conn.fileno()
-                except OSError: pass  # Expected
-                q3.put(('ok', ch is not None))
-            except Exception as e:
-                q3.put(('err', str(e)))
+    def srv3_worker():
+        try:
+            srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv_sock.bind(('127.0.0.1', port3))
+            srv_sock.listen(1)
+            q3.put(('listening', port3))
+            conn, _ = srv_sock.accept()
+            ch = Channel(conn)
+            # Verify fd ownership transferred (socket closed)
+            try: conn.fileno()
+            except OSError: pass  # expected
+            # Bidir
+            buf = bytearray(16)
+            ch.recv(buf)
+            ch.send(b"ACK_WRAP_SRV_CPT")
+            q3.put(('ok', bytes(buf)))
+        except Exception as e:
+            q3.put(('err', str(e)))
 
-        def cli3_worker():
-            try:
-                ch = Channel("127.0.0.1", port3, retry_timeout=10)
-                q3.put(('ok', ch is not None))
-            except Exception as e:
-                q3.put(('err', str(e)))
+    def cli3_worker():
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10)
+            s.connect(('127.0.0.1', port3))
+            s.settimeout(None)
+            ch = Channel(s)
+            ch.send(b"HELLO_WRAP_CLI_X")
+            buf = bytearray(16)
+            ch.recv(buf)
+            q3.put(('ok', bytes(buf)))
+        except Exception as e:
+            q3.put(('err', str(e)))
 
-        s3 = mp.Process(target=srv3_worker)
-        c3 = mp.Process(target=cli3_worker)
-        s3.start()
-        # Wait for server to be listening
-        q3.get(timeout=5)
-        c3.start()
-        s3.join(timeout=10); c3.join(timeout=10)
-        if s3.is_alive(): s3.terminate()
-        if c3.is_alive(): c3.terminate()
-        # Consume remaining
-        results = []
-        while not q3.empty():
-            results.append(q3.get())
-        ok_count = sum(1 for r in results if r[0] == 'ok')
-        check("Channel(sock=) + Channel(retry_timeout=)", ok_count >= 2,
-              f"got {ok_count}/2 ok")
+    s3 = mp.Process(target=srv3_worker)
+    c3 = mp.Process(target=cli3_worker)
+    s3.start()
+    q3.get(timeout=5)  # wait for listening
+    c3.start()
+    s3.join(timeout=10); c3.join(timeout=10)
+    if s3.is_alive(): s3.terminate()
+    if c3.is_alive(): c3.terminate()
 
-    # -- _from_ptr ------------------------------
+    results = []
+    while not q3.empty():
+        results.append(q3.get())
+    ok_srv = [r for r in results if r[0] == 'ok' and isinstance(r[1], bytes)]
+    ok_cli = [r for r in results if r[0] == 'ok' and r[1] == b"ACK_WRAP_SRV_CPT"]
+    check("Channel(sock) srv bidir", len(ok_srv) >= 1)
+    check("Channel(sock) cli bidir", len(ok_cli) >= 1)
+
+    # -- _from_ptr ------------------------------------
     try:
-        ch = Channel._from_ptr(0)  # Invalid handle, should not crash immediately
+        ch = Channel._from_ptr(0)
         check("Channel._from_ptr exists", True)
     except Exception:
         check("Channel._from_ptr exists (rejects invalid)", True)
 
-    # -- keyword arguments -----------------------
-    # Error: no port
-    try: Channel()
-    except TypeError: check("Channel() rejects no args", True)
-    else: check("Channel() rejects no args", False)
-
-    # Error: host without port
-    try: Channel(host="127.0.0.1")
-    except TypeError: check("Channel(host=...) rejects missing port", True)
-    else: check("Channel(host=...) rejects missing port", False)
-
-    # Error: mixed positional + keyword
-    try: Channel(14000, port=14000)
-    except TypeError: check("Channel(pos, kw) rejects mixed", True)
-    else: check("Channel(pos, kw) rejects mixed", False)
-
-    # Happy path: keyword server + keyword client
-    port4 = _find_free_port()
-    q4_srv, q4_cli = mp.Queue(), mp.Queue()
-
-    def srv4_worker():
-        try:
-            ch = Channel(port=port4)
-            q4_srv.put(('ok', True))
-        except Exception as e:
-            q4_srv.put(('err', str(e)))
-
-    def cli4_worker():
-        try:
-            time.sleep(0.05)
-            ch = Channel(host="127.0.0.1", port=port4)
-            q4_cli.put(('ok', True))
-        except Exception as e:
-            q4_cli.put(('err', str(e)))
-
-    s4 = mp.Process(target=srv4_worker)
-    c4 = mp.Process(target=cli4_worker)
-    s4.start(); c4.start()
-    s4.join(timeout=10); c4.join(timeout=10)
-    if s4.is_alive(): s4.terminate()
-    if c4.is_alive(): c4.terminate()
-
-    s4_ok = not q4_srv.empty() and q4_srv.get()[0] == 'ok'
-    c4_ok = not q4_cli.empty() and q4_cli.get()[0] == 'ok'
-    check("Channel(port=...) keyword server", s4_ok)
-    check("Channel(host=..., port=...) keyword client", c4_ok)
+    # -- Error: no args -------------------------------
+    try:
+        Channel()
+        check("Channel() rejects no args", False)
+    except TypeError:
+        check("Channel() rejects no args", True)
 
     print(f"  PASS={PASS}  FAIL={FAIL}")
     return PASS, FAIL

@@ -2,7 +2,7 @@
 import sys, os, time, random, socket, multiprocessing as mp
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 import mpmt
-from mpmt.channels import Channel
+from mpmt.channels import Channel, ChannelListener
 
 PASS = FAIL = 0
 
@@ -41,7 +41,8 @@ def run_tests(small=False):
 
         def srv_scalar():
             try:
-                ch = Channel(port)
+                listener = ChannelListener("127.0.0.1", port)
+                ch = listener.accept()
                 rt = mpmt.RingTransport(ell)(ch)
                 q_srv.put(('ok', rt.ell))
                 for _ in vals:
@@ -53,7 +54,7 @@ def run_tests(small=False):
         def cli_scalar():
             try:
                 time.sleep(0.05)
-                ch = Channel("127.0.0.1", port)
+                ch = Channel.connect("127.0.0.1", port)
                 rt = mpmt.RingTransport(ell)(ch)
                 q_cli.put(('ok', rt.ell))
                 for v in vals:
@@ -93,7 +94,7 @@ def run_tests(small=False):
             try:
                 # Use a socketpair (both ends on same process — no race)
                 a, b = socket.socketpair()
-                ch = Channel(sock=a)
+                ch = Channel(a)
                 rt = mpmt.RingTransport(ell)(ch)
                 rt.send_scalar(bad_val)
                 b.close()
@@ -122,7 +123,8 @@ def run_tests(small=False):
 
             def srv_vec():
                 try:
-                    ch = Channel(port)
+                    listener = ChannelListener("127.0.0.1", port)
+                    ch = listener.accept()
                     rt = mpmt.RingTransport(ell)(ch)
                     aux = mpmt.RvectorPack(ell)(n)
                     v_recv = Rv(n)
@@ -135,7 +137,7 @@ def run_tests(small=False):
             def cli_vec():
                 try:
                     time.sleep(0.05)
-                    ch = Channel("127.0.0.1", port)
+                    ch = Channel.connect("127.0.0.1", port)
                     rt = mpmt.RingTransport(ell)(ch)
                     aux = mpmt.RvectorPack(ell)(n)
                     rt.send_vector(vec=v_send, aux_buf=aux)
