@@ -1,13 +1,12 @@
 """Persistent TCP channels wrapping ``emp::NetIO``.
 
-``Channel(port)`` — server (listen).
-``Channel(host, port)`` — client (connect, emp-internal retry).
-``Channel(host, port, retry_timeout=N)`` — client (connect, Python-side retry
-with timeout in seconds).
-``Channel(sock=...)`` — wrap an already-connected Python socket.
+``Channel(sock)`` — wrap an already-connected Python socket.
+``Channel.connect(host, port, timeout=None)`` — connect with retry.
+``ChannelListener(host, port)`` — server-side bind/listen.
+  ``.accept()`` → ``Channel``
 
-``wrap_socket`` / ``connect_retry`` — low-level helpers (deprecated in
-favour of the ``sock=`` / ``retry_timeout=`` constructor arguments).
+All TCP connection establishment is handled by Python's ``socket`` module.
+NetIO only receives already-connected sockets via ``NetIO_from_socket``.
 
 @author  mincy
 @ref     emp::NetIO from emp-toolkit (https://github.com/emp-toolkit/emp-tool)
@@ -22,48 +21,15 @@ import mpmt._mpmt as _mpmt
 
 #  Channel class
 class Channel:
-    def __init__(self, *args, port=None, host=None, sock=None,
-                 retry_timeout: float | None = None):
-        n_pos = len(args)
-        if port is not None or host is not None or sock is not None:
-            if n_pos > 0:
-                raise TypeError(
-                    "Channel() accepts positional OR keyword args, not both"
-                )
-        elif n_pos == 1:
-            port = args[0]
-        elif n_pos == 2:
-            host, port = args
-        elif n_pos == 0:
-            raise TypeError(
-                "Channel(port) for server, Channel(host,port) for client, "
-                "or Channel(sock=...) for wrapping a socket"
-            )
-        else:
-            raise TypeError(
-                f"Channel() takes 1-2 positional args, got {n_pos}"
-            )
+    """A connected byte-stream channel.
 
-        if sock is not None:
-            # Wrap existing Python socket
-            fd = _os.dup(sock.fileno())
-            sock.close()
-            self._netio_ptr = _mpmt.NetIO_from_socket(fd)
-        elif host is not None:
-            if port is None:
-                raise TypeError("port is required with host")
-            if retry_timeout is not None:
-                # Python-side connect with retry + timeout
-                self._netio_ptr = _mpmt.NetIO_from_socket(
-                    _connect_retry(host, port, retry_timeout)
-                )
-            else:
-                # emp-internal connect with retry
-                self._netio_ptr = _mpmt.NetIO_connect(host, port)
-        else:
-            if port is None:
-                raise TypeError("port is required for server mode")
-            self._netio_ptr = _mpmt.NetIO_listen(port)
+    Always constructed from an already-connected Python socket.
+    """
+
+    def __init__(self, sock: _socket.socket):
+        fd = _os.dup(sock.fileno())
+        sock.close()
+        self._netio_ptr = _mpmt.NetIO_from_socket(fd)
 
     def __del__(self):
         if hasattr(self, '_netio_ptr') and self._netio_ptr != 0:
@@ -75,6 +41,30 @@ class Channel:
         ch = object.__new__(cls)
         ch._netio_ptr = ptr
         return ch
+
+    @classmethod
+    def connect(cls, host: str, port: int, timeout: float | None = None):
+        """Connect to *host*:*port*.
+
+        Retries until connection succeeds, or until *timeout* seconds
+        elapse.  If *timeout* is ``None``, retries forever.
+        """
+        deadline = _time.monotonic() + timeout if timeout is not None else None
+        while True:
+            try:
+                s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                s.settimeout(timeout)
+                s.connect((host, port))
+                s.settimeout(None)          # NetIO requires blocking
+                return cls(s)
+            except (ConnectionRefusedError, OSError):
+                s.close()
+                if deadline is not None and _time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Channel.connect: failed to connect to "
+                        f"{host}:{port} within {timeout}s"
+                    ) from None
+                _time.sleep(0.1)
 
     def acquire(self) -> int:
         _mpmt._netio_flush(self._netio_ptr)
@@ -91,31 +81,24 @@ class Channel:
         _mpmt._netio_recv(self._netio_ptr, buf)
 
 
-#  Low-level helpers
-def wrap_socket(sock) -> int:
-    fd = _os.dup(sock.fileno())
-    sock.close()
-    return _mpmt.NetIO_from_socket(fd)
+class ChannelListener:
+    """Bind + listen.  ``accept()`` returns a connected ``Channel``."""
 
+    def __init__(self, host: str, port: int):
+        self._sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        self._sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        self._sock.bind((host, port))
+        self._sock.listen(1)
 
-def connect_retry(host: str, port: int,
-                  timeout: float | None = None) -> int:
-    deadline = _time.monotonic() + timeout if timeout is not None else None
-    while True:
+    def accept(self) -> Channel:
+        """Accept one connection and return a ``Channel``."""
+        conn, _ = self._sock.accept()
+        self._sock.close()
+        return Channel(conn)
+
+    def close(self):
+        """Close the listener without accepting."""
         try:
-            s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-            s.connect((host, port))
-            fd = _os.dup(s.fileno())
-            s.close()
-            return fd
-        except (ConnectionRefusedError, OSError):
-            s.close()
-            if deadline is not None and _time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"connect_retry: failed to connect to {host}:{port} "
-                    f"within {timeout}s"
-                ) from None
-
-def _connect_retry(host: str, port: int, timeout: float) -> int:
-    """Same as ``connect_retry`` but returns a socket fd (used by Channel)."""
-    return connect_retry(host, port, timeout=timeout)
+            self._sock.close()
+        except OSError:
+            pass

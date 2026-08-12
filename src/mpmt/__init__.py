@@ -8,4 +8,4 @@ from mpmt.util import bf_param, gen_bf                               # noqa: F40
 from mpmt.querier import Querier                                    # noqa: F401,E402
 from mpmt.set_holder import SetHolder                               # noqa: F401,E402
 from mpmt.agent_server import AgentServer, ProtType, ServerRole     # noqa: F401,E402
-from mpmt.channels import Channel                                   # noqa: F401,E402
+from mpmt.channels import Channel, ChannelListener                  # noqa: F401,E402
