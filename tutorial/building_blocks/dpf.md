@@ -141,22 +141,24 @@ The query protocol uses DPF to generate the querier's Bloom filter without leaki
 ## Channel Topology
 
 DPF uses a star topology (not a ring). The Dealer listens on two ports; each Evaluator connects to one port.
-Channels are built via `channels.wrap_socket` and `channels.connect_retry`,
+Channels are built via `ChannelListener` / `Channel.connect` / `Channel(sock)`
 and injected at construction time.
 
 ```python
-from mpmt.channels import wrap_socket, connect_retry
+from mpmt.channels import Channel, ChannelListener
 
 # Dealer
-ch_eval0 = wrap_socket(connect_retry("127.0.0.1", 18000))
-ch_eval1 = wrap_socket(connect_retry("127.0.0.1", 18001))
+listener_e0 = ChannelListener("127.0.0.1", 18000)
+listener_e1 = ChannelListener("127.0.0.1", 18001)
+ch_eval0 = listener_e0.accept()
+ch_eval1 = listener_e1.accept()
 dealer = mpmt.DpfDealer(ell_in=20, ell_out=4)(ch_eval0, ch_eval1)
 
 # Evaluator 0
-ch_d = wrap_socket(connect_retry("127.0.0.1", 18000))
+ch_d = Channel.connect("127.0.0.1", 18000)
 eval0 = mpmt.DpfEvaluator(ell_in=20, ell_out=4, party=0)(ch_d)
 
 # Evaluator 1
-ch_d = wrap_socket(connect_retry("127.0.0.1", 18001))
+ch_d = Channel.connect("127.0.0.1", 18001)
 eval1 = mpmt.DpfEvaluator(ell_in=20, ell_out=4, party=1)(ch_d)
 ```

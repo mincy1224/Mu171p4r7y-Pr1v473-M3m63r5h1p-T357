@@ -1,41 +1,45 @@
 # Channel — Persistent TCP Channel
 
-Wraps `emp::NetIO`. Requires two parties communicating over TCP.
+Wraps `emp::NetIO`. All TCP connection establishment is done by Python's
+`socket` module; NetIO only receives already-connected sockets.
 
 ## Construction
 
-| Constructor | Role | Behavior |
-|------|------|------|
-| `Channel(port)` | Server | Listens on port, blocks until client connects |
-| `Channel(host, port)` | Client | Connects to remote, emp-internal retry (indefinite) |
-| `Channel(host, port, retry_timeout=N)` | Client | Connects to remote, Python-side retry with timeout in seconds |
-| `Channel(sock=...)` | — | Wraps an already-connected Python socket (takes ownership) |
+| Constructor | Description |
+|-------------|-------------|
+| `Channel(sock)` | Wraps an already-connected Python socket (takes ownership) |
+| `Channel.connect(host, port, timeout=None)` | Connect to remote; retries until success or timeout |
+| `ChannelListener(host, port)` | Server-side bind/listen |
+| `ChannelListener.accept()` → `Channel` | Accept one connection, return a `Channel` |
 
 ```python
-from mpmt.channels import Channel
+from mpmt.channels import Channel, ChannelListener
 
-# server
-ch_srv = Channel(port=14000)
+# server — listen then accept
+listener = ChannelListener("127.0.0.1", 14000)
+ch_srv = listener.accept()
 
-# client — indefinite retry (emp-internal)
-ch_cli = Channel("127.0.0.1", 14000)
+# client — connect with retry (5-second timeout per connect window)
+ch_cli = Channel.connect("127.0.0.1", 14000, timeout=5.0)
 
-# client — retry with 5-second timeout (Python-side)
-ch_cli = Channel("127.0.0.1", 14000, retry_timeout=5.0)
+# client — retry forever
+ch_cli = Channel.connect("127.0.0.1", 14000)
 
 # wrap an existing connected socket
 import socket
 s = socket.socket()
 s.connect(("127.0.0.1", 14000))
-ch = Channel(sock=s)
+ch = Channel(s)
 ```
 
-All constructors block until the connection is established (or timeout expires).
+`ChannelListener.__init__` (bind + listen) is non-blocking.
+`ChannelListener.accept()` blocks until a connection arrives.
+`Channel.connect()` blocks until connection succeeds or timeout elapses.
 
 ## Methods
 
 | Method | Description |
-|------|------|
+|--------|-------------|
 | `ch.acquire()` | Flush buffers, reset counters, return an IOChannel handle for use by C++ protocol instances |
 | `ch.flush()` | Flush the underlying NetIO send buffer |
 | `ch.send(data)` | Send `bytes` or `bytearray`, auto-flush |
@@ -54,80 +58,58 @@ add2_inst = mpmt.ShrAdd2(ell=14, party=0)(ch)
 add2_inst = mpmt.ShrAdd2(ell=4, party=0)(ch)  # overwrite variable
 ```
 
-## Low-level Helpers
+## ChannelListener
 
-`wrap_socket` and `connect_retry` are **deprecated** in favour of the `sock=` and `retry_timeout=`
-constructor arguments. They are retained for compatibility.
-
-### wrap_socket
-
-`wrap_socket(sock)` — Transfer a Python socket's fd to C++ NetIO.
-
-Procedure: `dup(sock.fileno())` → `sock.close()` → `NetIO_from_socket(fd)`.
-
-Returns a NetIO handle (`int`). NetIO takes exclusive ownership of the fd;
-the Python side no longer holds the socket.
-
-Prefer `Channel(sock=s)` instead.
-
-### connect_retry
-
-`connect_retry(host, port, timeout=None)` — Connect to remote with optional timeout.
+A thin wrapper around Python `socket.bind` + `socket.listen`.
 
 ```python
-while True:
-    try:
-        s.connect((host, port))
-        return s
-    except (ConnectionRefusedError, OSError):
-        if timeout is not None and time.monotonic() >= deadline:
-            raise TimeoutError(...)
+listener = ChannelListener("127.0.0.1", 14000)  # bind + listen (non-blocking)
+ch = listener.accept()                           # accept → Channel (blocking)
+listener.close()                                 # close without accepting
 ```
-
-Returns a connected Python `socket`, intended for use with `wrap_socket`.
-
-Prefer `Channel(host, port, retry_timeout=N)` instead.
-
-### Rationale
-
-These two helpers avoid the glibc `FILE*` deadlock in the daemon thread `NetIO_listen` —
-`fdopen` always executes in the calling thread. During multi-process startup,
-`connect_retry` polls until the peer is ready, eliminating races.
 
 ## Multi-Process Startup Pattern
 
 Using the Rep3 ring topology as an example, the strategy for breaking cyclic dependencies:
 
-- **P0, P2**: first `connect_retry` (connect to prev as client), then `Channel(port)` (wait for next as server)
-- **P1**: first `Channel(host, port)` (connect to prev as client), then `Channel(port)` (wait for next as server)
+- Every party: **bind/listen on its own PREV port** (non-blocking), then
+  **connect to NEXT** (blocking with retry), then **accept PREV**.
 
 ```python
-from mpmt.channels import wrap_socket, connect_retry, Channel
+from mpmt.channels import Channel, ChannelListener
 
-def build_rep3_channels(prev_port, next_host, next_port, party_id):
-    if party_id in (0, 2):
-        # P0, P2: connect to prev first (client), then wait for next (server)
-        ch_prev_sock = connect_retry("127.0.0.1", prev_port)
-        ch_prev = Channel._from_ptr(wrap_socket(ch_prev_sock))
-        ch_nxt = Channel(host=next_host, port=next_port)
-    else:  # party_id == 1
-        # P1: connect to prev first (client), then wait for next (server)
-        ch_prev = Channel(host="127.0.0.1", port=prev_port)
-        ch_nxt = Channel(port=next_port)
+def build_rep3_channels(prev_port, next_host, next_port):
+    # 1. Bind/listen (does NOT block)
+    listener = ChannelListener("127.0.0.1", prev_port)
+
+    # 2. Connect to NEXT (blocks until peer is up)
+    ch_nxt = Channel.connect(next_host, next_port, timeout=5.0)
+
+    # 3. Accept from PREV
+    ch_prev = listener.accept()
+
     return ch_prev, ch_nxt
 
 # Called by each of the three processes:
-# P0: build_rep3_channels(14000, "127.0.0.1", 14001, 0)
-# P1: build_rep3_channels(14000, "127.0.0.1", 14001, 1)
-# P2: build_rep3_channels(14000, "127.0.0.1", 14001, 2)
+# STEWARD: build_rep3_channels(14000, "127.0.0.1", 14001)
+# PEER0:   build_rep3_channels(14001, "127.0.0.1", 14002)
+# PEER1:   build_rep3_channels(14002, "127.0.0.1", 14000)
 ```
 
 Similarly for the DPF star topology:
 
 ```python
 # Dealer listens on two ports; each Evaluator connects to one
-ch_eval0 = Channel._from_ptr(wrap_socket(connect_retry("127.0.0.1", 18000)))
-ch_eval1 = Channel._from_ptr(wrap_socket(connect_retry("127.0.0.1", 18001)))
+listener_e0 = ChannelListener("127.0.0.1", 18000)
+listener_e1 = ChannelListener("127.0.0.1", 18001)
+ch_eval0 = listener_e0.accept()
+ch_eval1 = listener_e1.accept()
+
+# Evaluator 0
+ch_d = Channel.connect("127.0.0.1", 18000)
+
+# Evaluator 1
+ch_d = Channel.connect("127.0.0.1", 18001)
 ```
 
 ## Thread Safety
