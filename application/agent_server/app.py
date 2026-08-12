@@ -161,7 +161,7 @@ class C3AgentServer:
                     pass
 
             if prot_type in ("JOIN", "UPDATE"):
-                ch_set_holder = mpmt.Channel(sock=conn)
+                ch_set_holder = mpmt.Channel(conn)
                 if prot_type == "JOIN":
                     agent_token = self.prot_inst.response_share_bf(
                         prot_type=mpmt.ProtType.JOIN,
@@ -179,7 +179,7 @@ class C3AgentServer:
                     self._send({"event": "DONE", "user_id": user_id,
                                 "request_id": request_id}, _gen=_send_gen)
             else:  # QUERY
-                ch_querier = mpmt.Channel(sock=conn)
+                ch_querier = mpmt.Channel(conn)
                 self.prot_inst.response_query(ch_querier=ch_querier)
                 self._send({"event": "DONE", "user_id": user_id,
                             "request_id": request_id}, _gen=_send_gen)
@@ -204,49 +204,31 @@ class C3AgentServer:
 
         print(f"[{self._role}] Agent starting up ...", flush=True)
 
-        # 1. open ch_prev (listen) in background thread —
-        #    mpmt.Channel(port) blocks until the peer connects,
-        #    so we must NOT block the main thread here.
-        prev_result: dict = {}
-        prev_error: dict = {}
-
-        def _open_prev() -> None:
-            try:
-                prev_result["channel"] = mpmt.Channel(role_cfg["ch_prev_port"])
-            except Exception as e:
-                prev_error["error"] = e
-
-        print(f"[{self._role}] opening listen channel on :{role_cfg['ch_prev_port']} "
-              f"(background) ...", flush=True)
-        prev_thread = threading.Thread(target=_open_prev, daemon=True)
-        prev_thread.start()
-
-        # 2. main thread: connect to next peer with retry
-        print(f"[{self._role}] connecting to {self._nxt_role} "
-              f"at {self._nxt_cfg['ip']}:{role_cfg['ch_nxt_port']} ...",
+        # 1. Bind/listen on ch_prev_port — does NOT block
+        listener = mpmt.ChannelListener(role_cfg["ip"], role_cfg["ch_prev_port"])
+        print(f"[{self._role}] listening on :{role_cfg['ch_prev_port']} ...",
               flush=True)
-        ch_nxt = None
+
+        # 2. Connect to NEXT with retry
         attempt = 0
-        while ch_nxt is None:
+        while True:
             attempt += 1
             try:
-                ch_nxt = mpmt.Channel(self._nxt_cfg["ip"],
-                                      role_cfg["ch_nxt_port"],
-                                      retry_timeout=self._connect_timeout)
-            except (TimeoutError, OSError):
+                ch_nxt = mpmt.Channel.connect(
+                    self._nxt_cfg["ip"],
+                    role_cfg["ch_nxt_port"],
+                    timeout=self._connect_timeout,
+                )
+                break
+            except TimeoutError:
                 print(f"\r[{self._role}] waiting for {self._nxt_role} "
                       f"(attempt {attempt}) ...",
                       end="", flush=True)
         print(f"\n[{self._role}] connected to {self._nxt_role}", flush=True)
 
-        # 3. wait for ch_prev to be ready
-        print(f"[{self._role}] waiting for incoming connection from peer ...",
-              flush=True)
-        prev_thread.join()
-        if prev_error:
-            raise prev_error["error"]
-        ch_prev = prev_result["channel"]
-        print(f"[{self._role}] incoming connection established", flush=True)
+        # 3. Accept from PREV
+        ch_prev = listener.accept()
+        print(f"[{self._role}] accepted PREV", flush=True)
 
         # 4. create AgentServer (TreeCache init)
         print(f"[{self._role}] initialising TreeCache ...", flush=True)

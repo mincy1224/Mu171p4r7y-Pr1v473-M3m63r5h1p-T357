@@ -50,15 +50,15 @@ class C3SetHolder:
 
     # protocol
     def run_protocol(self, agents: dict, data_set: list[bytes]) -> None:
-        ch_steward = mpmt.Channel(agents["STEWARD"]["ip"],
-                                  agents["STEWARD"]["port"],
-                                  retry_timeout=self._connect_timeout)
-        ch_peer0 = mpmt.Channel(agents["PEER0"]["ip"],
-                                agents["PEER0"]["port"],
-                                retry_timeout=self._connect_timeout)
-        ch_peer1 = mpmt.Channel(agents["PEER1"]["ip"],
-                                agents["PEER1"]["port"],
-                                retry_timeout=self._connect_timeout)
+        ch_steward = mpmt.Channel.connect(agents["STEWARD"]["ip"],
+                                          agents["STEWARD"]["port"],
+                                          timeout=self._connect_timeout)
+        ch_peer0 = mpmt.Channel.connect(agents["PEER0"]["ip"],
+                                        agents["PEER0"]["port"],
+                                        timeout=self._connect_timeout)
+        ch_peer1 = mpmt.Channel.connect(agents["PEER1"]["ip"],
+                                        agents["PEER1"]["port"],
+                                        timeout=self._connect_timeout)
 
         self._prot_inst.share_bf(
             set=data_set,
@@ -69,20 +69,15 @@ class C3SetHolder:
         )
 
     # flow
-    def _reserve_and_execute(self, prot_type: str,
-                             data_set: list[bytes] | None = None) -> dict:
+    def reserve(self, prot_type: str) -> dict:
+        """Reserve only.  Returns the server response including op_id."""
         resp = self._post(f"/reserve_{prot_type.lower()}",
                           {"user_id": self._user_id})
-        if resp.get("status") == "REJECTED":
-            return resp
-        if resp.get("status") == "CONFLICT":
-            return resp
-        if resp.get("status") not in ("SUCCESSFUL", "ALREADY"):
-            return resp
-        op_id = resp.get("op_id")
-        if not op_id:
-            return {"status": "FAILED", "reason": "no op_id in response"}
+        return resp
 
+    def execute(self, prot_type: str, op_id: str,
+                data_set: list[bytes] | None = None) -> dict:
+        """Execute with a previously-reserved op_id."""
         protocol_started = False
         while True:
             resp = self._post("/execute", {"op_id": op_id})
@@ -95,12 +90,10 @@ class C3SetHolder:
             if status == "WAITING":
                 ahead = resp.get("ahead", 0)
                 delay = float(resp.get("retry_after", 1.0))
-
                 tag = prot_type.lower()
                 print(f"\r[{tag}] server: {ahead} task(s) ahead "
                       f"— retrying in {delay:.1f}s",
                       end="", flush=True)
-
                 end = time.monotonic() + delay
                 while time.monotonic() < end:
                     remaining = end - time.monotonic()
@@ -108,7 +101,6 @@ class C3SetHolder:
                           f"— retrying in {remaining:.1f}s",
                           end="", flush=True)
                     time.sleep(min(0.1, remaining))
-
                 print(f"\r[{tag}] contacting server..."
                       + " " * 30, end="", flush=True)
                 continue
@@ -124,8 +116,21 @@ class C3SetHolder:
                     self.run_protocol(resp["agents"], data_set or [])
                 time.sleep(1)
                 continue
-
             return resp
+
+    def _reserve_and_execute(self, prot_type: str,
+                             data_set: list[bytes] | None = None) -> dict:
+        resp = self.reserve(prot_type)
+        if resp.get("status") == "REJECTED":
+            return resp
+        if resp.get("status") == "CONFLICT":
+            return resp
+        if resp.get("status") not in ("SUCCESSFUL", "ALREADY"):
+            return resp
+        op_id = resp.get("op_id")
+        if not op_id:
+            return {"status": "FAILED", "reason": "no op_id in response"}
+        return self.execute(prot_type, op_id, data_set)
 
     def join(self, data_set: list[bytes]) -> dict:
         return self._reserve_and_execute("JOIN", data_set)
@@ -143,24 +148,70 @@ class C3SetHolder:
             args = []
 
         if not args:
-            print("usage: python run.py set_holder <user_id>")
+            print("usage: python run.py set_holder <user_id> [-r | -e <op_id>]")
             return
+
+        mode = "full"  # full | reserve | execute
+        op_id = None
+        prot_type = "JOIN"  # JOIN | UPDATE | QUIT
 
         user_id = args[0]
+        i = 1
+        while i < len(args):
+            a = args[i]
+            if a == "-r":
+                mode = "reserve"
+                if i + 1 < len(args) and args[i + 1] in ("JOIN", "UPDATE", "QUIT"):
+                    prot_type = args[i + 1]
+                    i += 1
+                i += 1
+            elif a == "-e":
+                mode = "execute"
+                if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                    op_id = args[i + 1]
+                    i += 2
+                else:
+                    print("usage: set_holder <user_id> -e <op_id> [JOIN|UPDATE|QUIT]")
+                    return
+            elif a in ("JOIN", "UPDATE", "QUIT"):
+                prot_type = a
+                i += 1
+            else:
+                i += 1
 
-        # load pretreat-generated dataset
-        cfg_root = read_json(os.path.join(_APP_DIR, "config.json"))
-        storage_root = cfg_root["storage_root_dir"]
-        npy_path = os.path.join(_APP_DIR, storage_root,
-                                f"set_holder_{user_id}", "set.npy")
-        if os.path.isfile(npy_path):
-            arr = np.load(npy_path)
-            data_set = [str(x).encode() for x in arr]
-            print(f"[set_holder] loaded {len(data_set)} elements from {npy_path}")
+        if mode in ("full", "execute"):
+            if prot_type != "QUIT":
+                cfg_root = read_json(os.path.join(_APP_DIR, "config.json"))
+                storage_root = cfg_root["storage_root_dir"]
+                npy_path = os.path.join(_APP_DIR, storage_root,
+                                        f"set_holder_{user_id}", "set.npy")
+                if os.path.isfile(npy_path):
+                    arr = np.load(npy_path)
+                    data_set = [str(x).encode() for x in arr]
+                    print(f"[set_holder] loaded {len(data_set)} elements from {npy_path}")
+                else:
+                    print(f"error: {npy_path} not found")
+                    return
+            else:
+                data_set = None
         else:
-            print(f"error: {npy_path} not found")
-            return
+            data_set = None
 
         sh = cls(user_id)
-        result = sh.join(data_set=data_set)
+
+        if mode == "reserve":
+            result = sh.reserve(prot_type)
+        elif mode == "execute":
+            if op_id is None:
+                print("error: -e requires <op_id>")
+                return
+            result = sh.execute(prot_type, op_id, data_set)
+        else:
+            if prot_type == "JOIN":
+                result = sh.join(data_set=data_set)
+            elif prot_type == "UPDATE":
+                result = sh.update(data_set=data_set)
+            else:
+                result = sh.quit()
+
         print(json.dumps(result, indent=2))

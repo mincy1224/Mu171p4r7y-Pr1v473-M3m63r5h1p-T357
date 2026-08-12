@@ -49,15 +49,15 @@ class C3Querier:
 
     # protocol
     def run_protocol(self, agents: dict) -> int:
-        ch_steward = mpmt.Channel(agents["STEWARD"]["ip"],
-                                  agents["STEWARD"]["port"],
-                                  retry_timeout=self._connect_timeout)
-        ch_peer0 = mpmt.Channel(agents["PEER0"]["ip"],
-                                agents["PEER0"]["port"],
-                                retry_timeout=self._connect_timeout)
-        ch_peer1 = mpmt.Channel(agents["PEER1"]["ip"],
-                                agents["PEER1"]["port"],
-                                retry_timeout=self._connect_timeout)
+        ch_steward = mpmt.Channel.connect(agents["STEWARD"]["ip"],
+                                          agents["STEWARD"]["port"],
+                                          timeout=self._connect_timeout)
+        ch_peer0 = mpmt.Channel.connect(agents["PEER0"]["ip"],
+                                        agents["PEER0"]["port"],
+                                        timeout=self._connect_timeout)
+        ch_peer1 = mpmt.Channel.connect(agents["PEER1"]["ip"],
+                                        agents["PEER1"]["port"],
+                                        timeout=self._connect_timeout)
 
         return self._prot_inst.query(
             element=self._element,
@@ -67,18 +67,12 @@ class C3Querier:
         )
 
     # flow
-    def query(self) -> dict:
-        resp = self._post("/reserve_query", {"user_id": self._user_id})
-        if resp.get("status") == "REJECTED":
-            return resp
-        if resp.get("status") == "CONFLICT":
-            return resp
-        if resp.get("status") not in ("SUCCESSFUL", "ALREADY"):
-            return resp
-        op_id = resp.get("op_id")
-        if not op_id:
-            return {"status": "FAILED", "reason": "no op_id in response"}
+    def reserve(self) -> dict:
+        """Reserve only.  Returns the server response including op_id."""
+        return self._post("/reserve_query", {"user_id": self._user_id})
 
+    def execute(self, op_id: str) -> dict:
+        """Execute with a previously-reserved op_id."""
         result = None
         protocol_started = False
         while True:
@@ -93,11 +87,9 @@ class C3Querier:
             if status == "WAITING":
                 ahead = resp.get("ahead", 0)
                 delay = float(resp.get("retry_after", 1.0))
-
                 print(f"\r[query] server: {ahead} task(s) ahead "
                       f"— retrying in {delay:.1f}s",
                       end="", flush=True)
-
                 end = time.monotonic() + delay
                 while time.monotonic() < end:
                     remaining = end - time.monotonic()
@@ -105,7 +97,6 @@ class C3Querier:
                           f"— retrying in {remaining:.1f}s",
                           end="", flush=True)
                     time.sleep(min(0.1, remaining))
-
                 print("\r[query] contacting server..."
                       + " " * 30, end="", flush=True)
                 continue
@@ -117,8 +108,20 @@ class C3Querier:
                     result = self.run_protocol(resp["agents"])
                 time.sleep(1)
                 continue
-
             return resp
+
+    def query(self) -> dict:
+        resp = self.reserve()
+        if resp.get("status") == "REJECTED":
+            return resp
+        if resp.get("status") == "CONFLICT":
+            return resp
+        if resp.get("status") not in ("SUCCESSFUL", "ALREADY"):
+            return resp
+        op_id = resp.get("op_id")
+        if not op_id:
+            return {"status": "FAILED", "reason": "no op_id in response"}
+        return self.execute(op_id)
 
     # CLI
     @classmethod
@@ -127,13 +130,47 @@ class C3Querier:
             args = []
 
         if not args:
-            print("usage: python run.py querier <user_id> <element>")
+            print("usage: python run.py querier <user_id> [-r | -e <op_id>] [<element>]")
             return
 
+        mode = "full"
+        op_id = None
+        element = None
+
         user_id = args[0]
-        element = args[1] if len(args) > 1 else input("element: ").strip()
-        element = element.encode()
+        i = 1
+        while i < len(args):
+            a = args[i]
+            if a == "-r":
+                mode = "reserve"
+                i += 1
+            elif a == "-e":
+                mode = "execute"
+                if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                    op_id = args[i + 1]
+                    i += 2
+                else:
+                    print("usage: querier <user_id> -e <op_id> [<element>]")
+                    return
+            else:
+                element = a
+                i += 1
+
+        if mode != "reserve":
+            if element is None:
+                element = input("element: ").strip()
+            element = element.encode()
 
         q = cls(user_id, element)
-        result = q.query()
+
+        if mode == "reserve":
+            result = q.reserve()
+        elif mode == "execute":
+            if op_id is None:
+                print("error: -e requires <op_id>")
+                return
+            result = q.execute(op_id)
+        else:
+            result = q.query()
+
         print(json.dumps(result, indent=2))

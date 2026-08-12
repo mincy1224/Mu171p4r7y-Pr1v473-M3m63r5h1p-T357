@@ -169,7 +169,7 @@ def run_cli(args: list[str] | None = None) -> None:
 
     if args is None:
         args = []
-    force = "--force" in args
+    force = "--force" in args or "-f" in args
 
     if "--onlyclr" in args:
         s = read_task_status()
