@@ -5,6 +5,7 @@
 #ifndef EMP2_HPP
 #define EMP2_HPP
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -154,48 +155,88 @@ namespace scucse::crypto
         // ———  circuit operations  ———
 
         /// AES-DM hash over XOR-shared preimage and key.
+        /// Key must be 16 bytes.  Preimage is arbitrary length — processed
+        /// in 16-byte blocks via Davies-Meyer chain:
+        ///   H_0 = 0,  H_i = AES(key, H_{i-1} ^ block_i) ^ H_{i-1}.
         /// @p myPt   local XOR share of the preimage
-        /// @p ptLen  preimage byte length (zero-padded to 128 bits in circuit)
+        /// @p ptLen  preimage byte length
         /// @p myKey  local XOR share of the 128-bit key (exactly 16 bytes)
         /// @return ring-addition share of the ELL-bit hash output
         uint32_t hash(const uint8_t* myPt, size_t ptLen, const uint8_t* myKey)
         {
-            if (ptLen > 16)
-                throw std::invalid_argument(
-                    "hash: preimage must be <= 16 bytes, got " + std::to_string(ptLen));
-            constexpr size_t N = 128;
-            bool pt[N] = {}, ky[N] = {};
-            bool zero[N] = {};
+            constexpr size_t BLOCK_BITS  = 128;
+            constexpr size_t BLOCK_BYTES = 16;
 
-            bytesToBits(myPt, ptLen, pt);
+            size_t nBlocks = (ptLen + BLOCK_BYTES - 1) / BLOCK_BYTES;
+            if (nBlocks == 0) nBlocks = 1;
+
+            // ——— preimage bits (nBlocks × 128, last block zero-padded) ———
+            size_t N = nBlocks * BLOCK_BITS;
+            std::vector<uint8_t> pt_u8(N, 0);
+            for (size_t b = 0; b < nBlocks; ++b)
+            {
+                size_t off  = b * BLOCK_BYTES;
+                size_t len  = std::min(ptLen - off, size_t(BLOCK_BYTES));
+                bool blockBits[BLOCK_BITS] = {};
+                bytesToBits(myPt + off, len, blockBits);
+                for (size_t i = 0; i < BLOCK_BITS; ++i)
+                    pt_u8[b * BLOCK_BITS + i] = blockBits[i] ? 1 : 0;
+            }
+            std::vector<uint8_t> zero_u8(N, 0);
+
+            // ——— key bits (always 128) ———
+            bool ky[BLOCK_BITS] = {};
             bytesToBits(myKey, 16, ky);
 
-            // P0 inputs their share as ALICE, P1 inputs their share as BOB.
-            // The "other" party's input slot is filled with zeros on each side —
-            // the OT protocol ensures the real value comes from the owning party.
-            auto aw   = sess_->input_bits(emp::ALICE, a() ? pt   : zero, N);
-            auto bw   = sess_->input_bits(emp::BOB,   a() ? zero : pt,   N);
-            auto ak   = sess_->input_bits(emp::ALICE, a() ? ky   : zero, N);
-            auto bk   = sess_->input_bits(emp::BOB,   a() ? zero : ky,   N);
+            // ——— input preimage (all blocks) ———
+            auto aw = sess_->input_bits(emp::ALICE,
+                          a() ? reinterpret_cast<bool*>(pt_u8.data())
+                              : reinterpret_cast<bool*>(zero_u8.data()), N);
+            auto bw = sess_->input_bits(emp::BOB,
+                          a() ? reinterpret_cast<bool*>(zero_u8.data())
+                              : reinterpret_cast<bool*>(pt_u8.data()), N);
 
-            // XOR-reconstruct in circuit (zero-cost: block XOR)
-            std::array<emp::block, N> ptWire, kyWire;
+            // XOR-reconstruct preimage wires
+            std::vector<emp::block> ptWire(N);
             for (size_t i = 0; i < N; ++i)
-            {
                 ptWire[i] = aw[i] ^ bw[i];
-                kyWire[i] = ak[i] ^ bk[i];
-            }
 
-            Blk ptBlk = Blk::from_wires(sess_->ctx(), ptWire.data());
+            // ——— input key ———
+            bool zero128[BLOCK_BITS] = {};
+            auto ak = sess_->input_bits(emp::ALICE, a() ? ky    : zero128, BLOCK_BITS);
+            auto bk = sess_->input_bits(emp::BOB,   a() ? zero128 : ky,    BLOCK_BITS);
+            std::array<emp::block, BLOCK_BITS> kyWire;
+            for (size_t i = 0; i < BLOCK_BITS; ++i)
+                kyWire[i] = ak[i] ^ bk[i];
             Blk kyBlk = Blk::from_wires(sess_->ctx(), kyWire.data());
 
-            auto dm = emp::circuit::crypto::aes128_encrypt(sess_->ctx(), ptBlk, kyBlk) ^ ptBlk;
-            auto h = dm.template slice<0, ELL>().as_uint();
+            // ——— Davies-Meyer chain ———
+            Blk h; // uninitialised — set from first block below
+            for (size_t b = 0; b < nBlocks; ++b)
+            {
+                Blk m = Blk::from_wires(sess_->ctx(),
+                                        ptWire.data() + b * BLOCK_BITS);
+                if (b == 0)
+                {
+                    // H_1 = AES(key, 0 ^ m_0) ^ 0 = AES(key, m_0)
+                    h = emp::circuit::crypto::aes128_encrypt(sess_->ctx(),
+                                                             m, kyBlk);
+                }
+                else
+                {
+                    Blk x = h ^ m;  // H_{i-1} ^ block_i
+                    auto ct = emp::circuit::crypto::aes128_encrypt(sess_->ctx(),
+                                                                   x, kyBlk);
+                    h = ct ^ h;     // AES(key, x) ^ H_{i-1}
+                }
+            }
+
+            auto hashVal = h.template slice<0, ELL>().as_uint();
 
             // re-share output (ring-addition) for downstream circuit ops
             uint32_t r = rand_mask();
             auto s = sess_->template input<U>(emp::ALICE, r);
-            auto v = h - s;
+            auto v = hashVal - s;
             auto rb = sess_->reveal(v, emp::BOB);
 
             if constexpr (a()) return r;

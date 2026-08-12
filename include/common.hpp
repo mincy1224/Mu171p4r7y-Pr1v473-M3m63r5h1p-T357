@@ -1,6 +1,7 @@
 #ifndef COMMON_HPP
 #define COMMON_HPP
 
+#include <algorithm>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -103,7 +104,9 @@ namespace scucse::crypto
     }
 
     /// AES-DM hash: H(preimage, key) → Z_{2^ell}.
-    /// Both preimage and key are truncated or zero-padded to exactly 16 bytes.
+    /// Key is truncated or zero-padded to exactly 16 bytes.
+    /// Preimage is arbitrary length — processed in 16-byte blocks
+    /// via Davies-Meyer chain: H_i = AES(key, H_{i-1} ^ block_i) ^ H_{i-1}.
     inline uint32_t hashAESDM
     (
         const uint8_t* preimage,
@@ -118,28 +121,44 @@ namespace scucse::crypto
                 "hashAESDM: ell must be in [" + std::to_string(RING_SCALAR_ELL_MIN)
                 + ", " + std::to_string(RING_SCALAR_ELL_MAX) + "]");
 
-        if (preimage_len > 16)
-            throw std::invalid_argument("hashAESDM: preimage must be ≤ 16 bytes");
         if (key_len > 16)
             throw std::invalid_argument("hashAESDM: key must be ≤ 16 bytes");
-        if (preimage == nullptr && preimage_len > 0)
-            throw std::invalid_argument("hashAESDM: preimage must not be null");
         if (key == nullptr && key_len > 0)
             throw std::invalid_argument("hashAESDM: key must not be null");
+        if (preimage == nullptr && preimage_len > 0)
+            throw std::invalid_argument("hashAESDM: preimage must not be null");
 
         using namespace emp;
-        uint8_t pt[16] = {}, k[16] = {};
-        if (preimage_len > 0) std::memcpy(pt, preimage, preimage_len);
-        if (key_len > 0)      std::memcpy(k, key, key_len);
+        uint8_t k[16] = {};
+        if (key_len > 0) std::memcpy(k, key, std::min(key_len, size_t(16)));
 
-        block x, key_block;
-        std::memcpy(&x, pt, sizeof(x));
+        block key_block;
         std::memcpy(&key_block, k, sizeof(key_block));
-
         PRP prp(key_block);
-        block ct = x;
-        prp.permute_block(&ct, 1);
-        block h = ct ^ x;
+
+        // Davies-Meyer chain: H_0 = 0, H_i = AES(key, H_{i-1} ^ M_i) ^ H_{i-1}
+        block h = _mm_setzero_si128();
+        size_t pos = 0;
+        while (pos + 16 <= preimage_len)
+        {
+            block m;
+            std::memcpy(&m, preimage + pos, sizeof(m));
+            block x = h ^ m;
+            prp.permute_block(&x, 1);
+            h = x ^ h;
+            pos += 16;
+        }
+        // Final (possibly partial) block
+        if (pos < preimage_len)
+        {
+            uint8_t last[16] = {};
+            std::memcpy(last, preimage + pos, preimage_len - pos);
+            block m;
+            std::memcpy(&m, last, sizeof(m));
+            block x = h ^ m;
+            prp.permute_block(&x, 1);
+            h = x ^ h;
+        }
 
         uint32_t h32 = (uint32_t) _mm_cvtsi128_si32(h);
         if (ell < 32)
