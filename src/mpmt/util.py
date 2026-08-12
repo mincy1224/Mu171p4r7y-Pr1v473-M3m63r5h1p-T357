@@ -66,28 +66,31 @@ def bf_param(set_size: int, fpr_mantissa: float, fpr_exponent: int):
     return bf_size, bf_size_log2up, hf_num, hf_num_log2up
 
 def gen_bf(
-    self, *,
+    *,
     ell: int,
     set: list[bytes],
-    hash_seed_list: list[bytes]
-):        
+    hash_seed_list: list[bytes],
+    bf_size: int,
+    hf_num: int,
+    ell_add2: int,
+):
     Rv = mpmt.Rvector(ell=ell)
-    bf = Rv(self._bf_size)
+    bf = Rv(bf_size)
     bf.fill(0)
     batch_size = min(
         2 ** 20,
-        max(2 ** 18, self._bf_size // 128),
+        max(2 ** 18, bf_size // 128),
     )
 
-    batch_cap = batch_size * self._hf_num
+    batch_cap = batch_size * hf_num
     batch_idx = array("Q", [0]) * batch_cap
     pos = 0
     for e in set:
         for hs in hash_seed_list:
             batch_idx[pos] = mpmt.ring_mod(
-                self._ell_add2,
-                mpmt.hash_aes_dm(preimage=e, key=hs, ell=self._ell_add2),
-                self._bf_size,
+                ell_add2,
+                mpmt.hash_aes_dm(preimage=e, key=hs, ell=ell_add2),
+                bf_size,
             )
             pos += 1
         if pos >= batch_cap:

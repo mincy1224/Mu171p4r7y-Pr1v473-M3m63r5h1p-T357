@@ -46,7 +46,10 @@ class SetHolder:
         bf = mpmt.gen_bf(
             ell=1,
             set=set,
-            hash_seed_list=hash_seed_list
+            hash_seed_list=hash_seed_list,
+            bf_size=self._bf_size,
+            hf_num=self._hf_num,
+            ell_add2=self._ell_add2,
         )
 
         rep3_inst.share_vector(

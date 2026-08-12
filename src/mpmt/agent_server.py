@@ -4,15 +4,24 @@ Agent Server
 """
 
 from __future__ import annotations
-from typing import Literal, Optional, overload
-import mpmt
+
 from enum import IntEnum
+import time
+from typing import Literal, overload
+
+import mpmt
+
 from ._tree_cache import _TreeCache
+
+
+_VALID_DPF_CORES = {1, 2, 4, 8, 16, 32}
+
 
 class ProtType(IntEnum):
     JOIN = 1
     UPDATE = 2
     QUIT = 3
+
 
 class ServerRole(IntEnum):
     STEWARD = 0
@@ -20,18 +29,20 @@ class ServerRole(IntEnum):
     PEER1 = 2
     # Topology: STEWARD → PEER0 → PEER1 → STEWARD
 
+
 class AgentServer:
     def __init__(
-        self, *, 
+        self, *,
         server_role: ServerRole,
-        set_size: int, 
+        set_size: int,
         fpr_mantissa: float,
-        fpr_exponent: int, 
+        fpr_exponent: int,
         storage_dir: str,
         ch_prev,
         ch_nxt,
-        hash_seed_list: Optional[list] = None,
-        cores: int
+        hash_seed_list: list[bytes] | None = None,
+        cores: int,
+        debug_init: bool = True,
     ):
         if not isinstance(server_role, ServerRole):
             raise TypeError(
@@ -39,90 +50,187 @@ class AgentServer:
                 f"got {type(server_role).__name__}"
             )
 
-        if server_role == ServerRole.STEWARD:
+        if isinstance(cores, bool) or not isinstance(cores, int):
+            raise TypeError("cores must be an integer")
+        
+        if cores not in _VALID_DPF_CORES:
+            raise ValueError(
+                f"cores must be one of {sorted(_VALID_DPF_CORES)}, got {cores}"
+            )
+
+        if not isinstance(storage_dir, str) or not storage_dir:
+            raise TypeError("storage_dir must be a non-empty string")
+
+        for name, channel in (("ch_prev", ch_prev), ("ch_nxt", ch_nxt)):
+            if channel is None or not callable(getattr(channel, "acquire", None)):
+                raise TypeError(
+                    f"{name} must be a Channel-like object with acquire()"
+                )
+
+        if server_role is ServerRole.STEWARD:
             if hash_seed_list is None:
                 raise ValueError(
                     "hash_seed_list is required when server_role is STEWARD"
                 )
-        else:
-            if hash_seed_list is not None:
-                raise ValueError(
-                    "hash_seed_list is only valid when server_role is STEWARD"
-                )
+            if not isinstance(hash_seed_list, list):
+                raise TypeError("hash_seed_list must be a list of 16-byte values")
+            for i, seed in enumerate(hash_seed_list):
+                if not isinstance(seed, bytes) or len(seed) != 16:
+                    raise ValueError(
+                        f"hash_seed_list[{i}] must be exactly 16 bytes"
+                    )
+        elif hash_seed_list is not None:
+            raise ValueError(
+                "hash_seed_list is only valid when server_role is STEWARD"
+            )
 
+        self._debug_init = bool(debug_init)
         self._cores = cores
         self._server_role = server_role
+        self._ch_prev = ch_prev
+        self._ch_nxt = ch_nxt
 
-        self._bf_size, self._ell_add2, self._hf_num, self._ell_root = mpmt.bf_param(
-            set_size, fpr_mantissa, fpr_exponent
+        self._bf_size, self._ell_add2, self._hf_num, self._ell_root = (
+            mpmt.bf_param(set_size, fpr_mantissa, fpr_exponent)
         )
 
-        if self._server_role == ServerRole.STEWARD:
+        if self._server_role is ServerRole.STEWARD:
             self._hash_seed_list = hash_seed_list
-            
             if self._hf_num != len(self._hash_seed_list):
                 raise ValueError(
-                    f"Hash function count mismatch: "
+                    "Hash function count mismatch: "
                     f"self._hf_num={self._hf_num}, "
-                    f"len(self._hash_seed_list)={len(self._hash_seed_list)}"
+                    f"len(hash_seed_list)={len(self._hash_seed_list)}"
                 )
 
-        self._ch_prev = ch_prev
-        self._ch_nxt  = ch_nxt
-        self._rep3_inst_ell1 = mpmt.ShrRep3(
-            ell=1,
-            party=int(self._server_role)
-        )(self._ch_prev, self._ch_nxt)
+        self._log(
+            "parameters: "
+            f"bf_size={self._bf_size}, "
+            f"ell_add2={self._ell_add2}, "
+            f"hf_num={self._hf_num}, "
+            f"ell_root={self._ell_root}, "
+            f"cores={self._cores}"
+        )
 
-        self._rep3_inst_ell_root = mpmt.ShrRep3(
-            ell=self._ell_root,
-            party=int(self._server_role)
-        )(self._ch_prev, self._ch_nxt)
+        # IMPORTANT:
+        # Do not insert any custom barrier/handshake here.  ShrRep3 itself
+        # performs its own key exchange.  Extra bytes on these channels would
+        # corrupt the protocol stream.
+        self._rep3_inst_ell1 = self._init_step(
+            "ShrRep3(ell=1)",
+            lambda: mpmt.ShrRep3(
+                ell=1,
+                party=int(self._server_role),
+            )(self._ch_prev, self._ch_nxt),
+        )
 
-        if self._server_role == ServerRole.STEWARD:
-            self._server_dpf_inst = mpmt.DpfDealer(
+        self._rep3_inst_ell_root = self._init_step(
+            f"ShrRep3(ell={self._ell_root})",
+            lambda: mpmt.ShrRep3(
+                ell=self._ell_root,
+                party=int(self._server_role),
+            )(self._ch_prev, self._ch_nxt),
+        )
+
+        self._server_dpf_inst = self._init_step(
+            "DPF",
+            self._build_dpf,
+        )
+
+        self._pack_buf = self._init_step(
+            f"RvectorPack(ell=1, n={self._bf_size})",
+            lambda: mpmt.RvectorPack(ell=1)(self._bf_size),
+        )
+
+        self._merge_buf = self._init_step(
+            f"ShrRep3ShareVec(ell=1, n={self._bf_size})",
+            lambda: mpmt.ShrRep3ShareVec(ell=1)(self._bf_size),
+        )
+
+        self._query_buf = self._init_step(
+            f"ShrRep3ShareVec(ell={self._ell_root}, n={self._bf_size})",
+            lambda: mpmt.ShrRep3ShareVec(
+                ell=self._ell_root
+            )(self._bf_size),
+        )
+
+        self._tc = self._init_step(
+            "TreeCache",
+            lambda: _TreeCache(
+                storage_dir=storage_dir,
+                bf_size=self._bf_size,
+                ell_root=self._ell_root,
+                merge_fn=self._merge,
+                ring_conv_fn=self._rep3_inst_ell1.ring_conv_vec,
+            ),
+        )
+
+        self._log("initialisation complete")
+
+    # ------------------------------------------------------------------
+    # initialisation helpers
+
+    def _log(self, message: str) -> None:
+        if self._debug_init:
+            print(
+                f"[mpmt.AgentServer:{self._server_role.name}] {message}",
+                flush=True,
+            )
+
+    def _init_step(self, name: str, factory):
+        start = time.monotonic()
+        self._log(f"BEGIN {name}")
+        try:
+            result = factory()
+        except Exception as exc:
+            elapsed = time.monotonic() - start
+            self._log(
+                f"FAILED {name} after {elapsed:.3f}s: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            raise
+        elapsed = time.monotonic() - start
+        self._log(f"DONE  {name} ({elapsed:.3f}s)")
+        return result
+
+    def _build_dpf(self):
+        if self._server_role is ServerRole.STEWARD:
+            return mpmt.DpfDealer(
                 ell_in=self._ell_add2,
-                ell_out=self._ell_root
+                ell_out=self._ell_root,
             )(self._ch_nxt, self._ch_prev)
 
-        elif self._server_role == ServerRole.PEER0:
-            self._server_dpf_inst = mpmt.DpfEvaluator(
+        if self._server_role is ServerRole.PEER0:
+            return mpmt.DpfEvaluator(
                 ell_in=self._ell_add2,
                 ell_out=self._ell_root,
-                party=0
+                party=0,
             )(self._ch_prev)
 
-        elif self._server_role == ServerRole.PEER1:
-            self._server_dpf_inst = mpmt.DpfEvaluator(
-                ell_in=self._ell_add2,
-                ell_out=self._ell_root,
-                party=1
-            )(self._ch_nxt)
+        return mpmt.DpfEvaluator(
+            ell_in=self._ell_add2,
+            ell_out=self._ell_root,
+            party=1,
+        )(self._ch_nxt)
 
-        self._pack_buf = mpmt.RvectorPack(ell=1)(self._bf_size)
-        self._merge_buf = mpmt.ShrRep3ShareVec(ell=1)(self._bf_size)
-        self._query_buf = mpmt.ShrRep3ShareVec(ell=self._ell_root)(self._bf_size)
-
-        self._tc = _TreeCache(
-            storage_dir=storage_dir, 
-            bf_size=self._bf_size,
-            ell_root=self._ell_root, 
-            merge_fn=self._merge,
-            ring_conv_fn=self._rep3_inst_ell1.ring_conv_vec
-        )
+    # ------------------------------------------------------------------
+    # TreeCache merge primitive
 
     def _merge(self, *, sva, svb, svout):
         self._rep3_inst_ell1.add_vec(sva, svb, svout)
         self._rep3_inst_ell1.hadamard(
             sva,
             svb,
-            self._pack_buf
+            self._pack_buf,
         )
         self._rep3_inst_ell1.sub_vec(
             svout,
             self._pack_buf,
-            svout
+            svout,
         )
+
+    # ------------------------------------------------------------------
+    # set-holder protocol
 
     @overload
     def response_share_bf(
@@ -132,7 +240,6 @@ class AgentServer:
         ch_set_holder: mpmt.channels.Channel,
     ) -> str:
         ...
-
 
     @overload
     def response_share_bf(
@@ -144,7 +251,6 @@ class AgentServer:
     ) -> None:
         ...
 
-
     @overload
     def response_share_bf(
         self,
@@ -153,7 +259,6 @@ class AgentServer:
         token: str,
     ) -> None:
         ...
-
 
     def response_share_bf(
         self,
@@ -168,6 +273,8 @@ class AgentServer:
                 f"got {type(prot_type).__name__}"
             )
 
+        # QUIT has no set-holder data channel, but it still changes the
+        # TreeCache and therefore must finish the cache merge before success.
         if prot_type is ProtType.QUIT:
             if token is None:
                 raise TypeError("QUIT requires keyword argument 'token'")
@@ -178,12 +285,12 @@ class AgentServer:
                 )
 
             self._tc.remove(del_token=token)
+            self._tc.execute_merge()
             return None
 
         if ch_set_holder is None:
             raise TypeError(
-                f"{prot_type.name} requires keyword argument "
-                "'ch_set_holder'"
+                f"{prot_type.name} requires keyword argument 'ch_set_holder'"
             )
 
         if prot_type is ProtType.UPDATE:
@@ -191,17 +298,14 @@ class AgentServer:
                 raise TypeError(
                     "UPDATE requires keyword argument 'token'"
                 )
-
             if not self._tc.has_inserted(token=token):
                 raise KeyError(
                     f"Unknown TreeCache token: {token!r}"
                 )
 
+        # Receive the new Bloom-filter share.
         if self._server_role is ServerRole.STEWARD:
-            rt_inst = mpmt.RingTransport(ell=1)(
-                ch_set_holder
-            )
-
+            rt_inst = mpmt.RingTransport(ell=1)(ch_set_holder)
             for share in (
                 self._merge_buf.this_share,
                 self._merge_buf.nxt_share,
@@ -210,7 +314,6 @@ class AgentServer:
                     share,
                     self._pack_buf,
                 )
-
         else:
             if self._server_role is ServerRole.PEER0:
                 ch_prev = ch_set_holder
@@ -230,15 +333,21 @@ class AgentServer:
             )
 
         if prot_type is ProtType.JOIN:
-            return self._tc.insert(
+            new_token = self._tc.insert(
                 node=self._merge_buf
             )
+            # A successful JOIN must leave root_node consistent with the
+            # inserted leaf before the Agent reports DONE.
+            self._tc.execute_merge()
+            return new_token
 
         if prot_type is ProtType.UPDATE:
             self._tc.update(
                 token=token,
                 new_node=self._merge_buf,
             )
+            # Same rule for UPDATE.
+            self._tc.execute_merge()
             return None
 
         raise ValueError(
@@ -246,6 +355,11 @@ class AgentServer:
         )
 
     def sync_cache(self) -> None:
+        """Explicit cache synchronisation retained for compatibility.
+
+        ``response_share_bf`` already synchronises JOIN/UPDATE/QUIT before
+        returning, so normal callers should not need to call this again.
+        """
         self._tc.execute_merge()
 
     def response_query(

@@ -36,9 +36,7 @@ class Querier:
             h_share = add2_inst_steward.hash(element_share, key_share)
             idx_share = add2_inst_steward.mod(h_share, self._bf_size)
             rt_inst_peer1.send_scalar(
-                val=add2_inst_peer0.share_scalar(
-                    val=idx_share
-                )
+                add2_inst_peer0.share_scalar(idx_share)
             )
 
         rt_inst_peer1       = mpmt.RingTransport(ell=self._ell_root)(ch_peer1)
