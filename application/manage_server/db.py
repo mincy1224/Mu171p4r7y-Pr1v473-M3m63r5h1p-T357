@@ -97,12 +97,15 @@ class DB:
                 "ALTER TABLE operations ADD COLUMN error_code TEXT")
         except sqlite3.OperationalError:
             pass
-        # one live operation per user (defense-in-depth against races)
+        # migration: replace old per-user index with per-(user,service)
+        self._conn.execute(
+            "DROP INDEX IF EXISTS idx_one_live_op_per_user")
         try:
             self._conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_live_op_per_user "
-                "ON operations(user_id) "
-                "WHERE status IN ('QUEUED','ACTIVE','BUSY')")
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_one_live_op_per_user_service "
+                "ON operations(user_id, prot_type) "
+                "WHERE status IN ('RESERVED','QUEUED','ACTIVE','BUSY')")
         except sqlite3.OperationalError:
             pass
         self._conn.commit()
@@ -170,6 +173,20 @@ class DB:
             self._conn.commit()
             return cur.lastrowid
 
+    def create_reserved_operation(self, user_id: str, prot_type: str
+                                  ) -> int:
+        """Insert a new RESERVED operation (queue_pos=NULL). Returns op_id."""
+        with self._lock:
+            now = _now()
+            cur = self._conn.execute(
+                "INSERT INTO operations (user_id, prot_type, status, queue_pos, "
+                "overtime_count, created_at, updated_at) "
+                "VALUES (?,?,'RESERVED',NULL,0,?,?)",
+                (user_id, prot_type, now, now),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
     def get_operation(self, op_id: int) -> dict | None:
         with self._lock:
             row = self._conn.execute(
@@ -188,25 +205,38 @@ class DB:
             ).fetchone()
             return dict(row) if row else None
 
-    def is_already_queued(self, user_id: str) -> bool:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT 1 FROM operations "
-                "WHERE user_id=? AND status IN ('QUEUED','ACTIVE','BUSY')",
-                (user_id,),
-            ).fetchone()
-            return row is not None
-
-    def get_active_operation_by_user(self, user_id: str) -> dict | None:
-        """Return the live operation for *user_id*, if any."""
+    def get_live_operation(self, user_id: str, prot_type: str
+                            ) -> dict | None:
+        """Return the live operation for (user_id, prot_type), if any."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM operations "
-                "WHERE user_id=? AND status IN ('QUEUED','ACTIVE','BUSY') "
+                "WHERE user_id=? AND prot_type=? "
+                "AND status IN ('RESERVED','QUEUED','ACTIVE','BUSY') "
                 "ORDER BY op_id DESC LIMIT 1",
-                (user_id,),
+                (user_id, prot_type),
             ).fetchone()
             return dict(row) if row else None
+
+    def enqueue_reserved(self, op_id: int) -> bool:
+        """Transition RESERVED → QUEUED with a new queue_pos.
+        Returns True if the transition happened, False otherwise."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM operations WHERE op_id=?", (op_id,)
+            ).fetchone()
+            if not row or row["status"] != "RESERVED":
+                return False
+            pos = self._conn.execute(
+                "SELECT COALESCE(MAX(queue_pos), 0) + 1 FROM operations "
+                "WHERE status IN ('QUEUED','ACTIVE','BUSY')",
+            ).fetchone()[0]
+            self._conn.execute(
+                "UPDATE operations SET status='QUEUED', queue_pos=?, "
+                "updated_at=? WHERE op_id=?",
+                (pos, _now(), op_id))
+            self._conn.commit()
+            return True
 
     def update_operation(self, op_id: int, status: str, **kwargs) -> None:
         """Update status + optional fields (queue_pos, overtime_count, error_code)."""
@@ -307,12 +337,12 @@ class DB:
                             error_code=error_code)
 
     def fail_all_live_operations(self, error_code: str) -> None:
-        """Fail every QUEUED/ACTIVE/BUSY operation (cracked task cleanup)."""
+        """Fail every RESERVED/QUEUED/ACTIVE/BUSY operation (cracked cleanup)."""
         with self._lock:
             self._conn.execute(
                 "UPDATE operations SET status='FAILED', queue_pos=NULL, "
                 "error_code=?, updated_at=? "
-                "WHERE status IN ('QUEUED','ACTIVE','BUSY')",
+                "WHERE status IN ('RESERVED','QUEUED','ACTIVE','BUSY')",
                 (error_code, _now()),
             )
             self._conn.commit()

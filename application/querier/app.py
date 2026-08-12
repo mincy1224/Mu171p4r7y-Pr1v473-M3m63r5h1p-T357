@@ -68,21 +68,28 @@ class C3Querier:
 
     # flow
     def reserve(self) -> dict:
-        """Reserve only.  Returns the server response including op_id."""
         return self._post("/reserve_query", {"user_id": self._user_id})
 
-    def execute(self, op_id: str) -> dict:
-        """Execute with a previously-reserved op_id."""
+    def execute(self) -> dict:
+        """Poll /execute until DONE.  Pins internal _op_id after first call."""
+        internal_op_id = None
         result = None
         protocol_started = False
         while True:
-            resp = self._post("/execute", {"op_id": op_id})
+            body = {"user_id": self._user_id, "prot_type": "QUERY"}
+            if internal_op_id is not None:
+                body["op_id"] = internal_op_id
+            resp = self._post("/execute", body)
             status = resp.get("status")
+            if "_op_id" in resp:
+                internal_op_id = resp["_op_id"]
 
             if status == "DONE":
                 resp["result"] = result
                 return resp
-            if status in ("REMOVED", "FAILED", "NOT_FOUND"):
+            if status in ("REMOVED", "FAILED", "NOT_FOUND", "NOT_RESERVED"):
+                return resp
+            if status == "REJECTED":
                 return resp
             if status == "WAITING":
                 ahead = resp.get("ahead", 0)
@@ -101,27 +108,15 @@ class C3Querier:
                       + " " * 30, end="", flush=True)
                 continue
             if status == "BUSY":
-                if not protocol_started:
+                agents = resp.get("agents")
+                if agents is not None and not protocol_started:
                     protocol_started = True
                     print("\r[query] executing query protocol..."
                           + " " * 30)
-                    result = self.run_protocol(resp["agents"])
+                    result = self.run_protocol(agents)
                 time.sleep(1)
                 continue
             return resp
-
-    def query(self) -> dict:
-        resp = self.reserve()
-        if resp.get("status") == "REJECTED":
-            return resp
-        if resp.get("status") == "CONFLICT":
-            return resp
-        if resp.get("status") not in ("SUCCESSFUL", "ALREADY"):
-            return resp
-        op_id = resp.get("op_id")
-        if not op_id:
-            return {"status": "FAILED", "reason": "no op_id in response"}
-        return self.execute(op_id)
 
     # CLI
     @classmethod
@@ -129,48 +124,34 @@ class C3Querier:
         if args is None:
             args = []
 
-        if not args:
-            print("usage: python run.py querier <user_id> [-r | -e <op_id>] [<element>]")
+        if len(args) < 2:
+            print("usage: python3 run.py querier -r QUERY <user_id>")
+            print("       python3 run.py querier -e QUERY <user_id> <element>")
             return
 
-        mode = "full"
-        op_id = None
-        element = None
+        flag = args[0]
+        if flag not in ("-r", "-e"):
+            print("error: must specify -r (reserve) or -e (execute)")
+            return
 
-        user_id = args[0]
-        i = 1
-        while i < len(args):
-            a = args[i]
-            if a == "-r":
-                mode = "reserve"
-                i += 1
-            elif a == "-e":
-                mode = "execute"
-                if i + 1 < len(args) and not args[i + 1].startswith("-"):
-                    op_id = args[i + 1]
-                    i += 2
-                else:
-                    print("usage: querier <user_id> -e <op_id> [<element>]")
-                    return
-            else:
-                element = a
-                i += 1
+        if args[1] != "QUERY":
+            print("error: querier only supports QUERY")
+            return
 
-        if mode != "reserve":
-            if element is None:
-                element = input("element: ").strip()
-            element = element.encode()
+        user_id = args[2] if len(args) > 2 else ""
+        if not user_id:
+            print("error: user_id required")
+            return
 
-        q = cls(user_id, element)
-
-        if mode == "reserve":
+        if flag == "-r":
+            q = cls(user_id, b"")  # element not needed for reserve
             result = q.reserve()
-        elif mode == "execute":
-            if op_id is None:
-                print("error: -e requires <op_id>")
-                return
-            result = q.execute(op_id)
-        else:
-            result = q.query()
+            print(json.dumps(result, indent=2))
+            return
 
+        # -e QUERY <user_id> [element]
+        element = args[3] if len(args) > 3 else input("element: ").strip()
+        element = element.encode()
+        q = cls(user_id, element)
+        result = q.execute()
         print(json.dumps(result, indent=2))

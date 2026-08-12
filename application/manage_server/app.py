@@ -173,6 +173,21 @@ class C3ManageServer:
 
         # reserve
 
+        def _reserve_impl(user_id: str, prot_type: str, allowed_users: dict):
+            if not user_id:
+                return jsonify({"status": "FAILED"}), 400
+            if user_id not in allowed_users:
+                return jsonify({"status": "REJECTED",
+                                "reason": "unknown user_id"})
+            with self._lock:
+                live = db.get_live_operation(user_id, prot_type)
+                if live:
+                    return jsonify({"status": "ALREADY",
+                                    "_op_id": live["op_id"]})
+                op_id = db.create_reserved_operation(user_id, prot_type)
+                return jsonify({"status": "SUCCESSFUL",
+                                "_op_id": op_id})
+
         @app.route("/reserve_join", methods=["POST"])
         def reserve_join():
             if self._task_cracked:
@@ -182,35 +197,7 @@ class C3ManageServer:
                 return jsonify({"status": "FAILED",
                                 "reason": "AGENT_UNAVAILABLE"}), 503
             data = request.get_json(silent=True) or {}
-            user_id = data.get("user_id")
-            if not user_id:
-                return jsonify({"status": "FAILED"}), 400
-            if user_id not in SET_HOLDER_USERS:
-                return jsonify({"status": "REJECTED",
-                                "reason": "unknown user_id"})
-
-            user = db.get_user(user_id)
-            if user and user["status"] == "JOINED":
-                return jsonify({"status": "REJECTED",
-                                "reason": "already joined"})
-            with self._lock:
-                if self._task_cracked:
-                    return jsonify({"status": "FAILED",
-                                    "reason": "TASK_CRACKED"}), 503
-                if not self._agents_available:
-                    return jsonify({"status": "FAILED",
-                                    "reason": "AGENT_UNAVAILABLE"}), 503
-                active = db.get_active_operation_by_user(user_id)
-                if active:
-                    if active["prot_type"] == "JOIN":
-                        return jsonify({"status": "ALREADY",
-                                        "op_id": active["op_id"]})
-                    else:
-                        return jsonify({"status": "CONFLICT",
-                                        "reason": f"user has active {active['prot_type']} operation"}), 409
-                pos = db.next_queue_pos()
-                op_id = db.create_operation(user_id, "JOIN", pos)
-            return jsonify({"status": "SUCCESSFUL", "op_id": op_id})
+            return _reserve_impl(data.get("user_id"), "JOIN", SET_HOLDER_USERS)
 
         @app.route("/reserve_update", methods=["POST"])
         def reserve_update():
@@ -221,35 +208,7 @@ class C3ManageServer:
                 return jsonify({"status": "FAILED",
                                 "reason": "AGENT_UNAVAILABLE"}), 503
             data = request.get_json(silent=True) or {}
-            user_id = data.get("user_id")
-            if not user_id:
-                return jsonify({"status": "FAILED"}), 400
-            if user_id not in SET_HOLDER_USERS:
-                return jsonify({"status": "REJECTED",
-                                "reason": "unknown user_id"})
-
-            user = db.get_user(user_id)
-            if not user or user["status"] != "JOINED":
-                return jsonify({"status": "REJECTED",
-                                "reason": "not joined yet"})
-            with self._lock:
-                if self._task_cracked:
-                    return jsonify({"status": "FAILED",
-                                    "reason": "TASK_CRACKED"}), 503
-                if not self._agents_available:
-                    return jsonify({"status": "FAILED",
-                                    "reason": "AGENT_UNAVAILABLE"}), 503
-                active = db.get_active_operation_by_user(user_id)
-                if active:
-                    if active["prot_type"] == "UPDATE":
-                        return jsonify({"status": "ALREADY",
-                                        "op_id": active["op_id"]})
-                    else:
-                        return jsonify({"status": "CONFLICT",
-                                        "reason": f"user has active {active['prot_type']} operation"}), 409
-                pos = db.next_queue_pos()
-                op_id = db.create_operation(user_id, "UPDATE", pos)
-            return jsonify({"status": "SUCCESSFUL", "op_id": op_id})
+            return _reserve_impl(data.get("user_id"), "UPDATE", SET_HOLDER_USERS)
 
         @app.route("/reserve_query", methods=["POST"])
         def reserve_query():
@@ -260,30 +219,7 @@ class C3ManageServer:
                 return jsonify({"status": "FAILED",
                                 "reason": "AGENT_UNAVAILABLE"}), 503
             data = request.get_json(silent=True) or {}
-            user_id = data.get("user_id")
-            if not user_id:
-                return jsonify({"status": "FAILED"}), 400
-            if user_id not in QUERIER_USERS:
-                return jsonify({"status": "REJECTED",
-                                "reason": "unknown user_id"})
-            with self._lock:
-                if self._task_cracked:
-                    return jsonify({"status": "FAILED",
-                                    "reason": "TASK_CRACKED"}), 503
-                if not self._agents_available:
-                    return jsonify({"status": "FAILED",
-                                    "reason": "AGENT_UNAVAILABLE"}), 503
-                active = db.get_active_operation_by_user(user_id)
-                if active:
-                    if active["prot_type"] == "QUERY":
-                        return jsonify({"status": "ALREADY",
-                                        "op_id": active["op_id"]})
-                    else:
-                        return jsonify({"status": "CONFLICT",
-                                        "reason": f"user has active {active['prot_type']} operation"}), 409
-                pos = db.next_queue_pos()
-                op_id = db.create_operation(user_id, "QUERY", pos)
-            return jsonify({"status": "SUCCESSFUL", "op_id": op_id})
+            return _reserve_impl(data.get("user_id"), "QUERY", QUERIER_USERS)
 
         @app.route("/reserve_quit", methods=["POST"])
         def reserve_quit():
@@ -294,62 +230,46 @@ class C3ManageServer:
                 return jsonify({"status": "FAILED",
                                 "reason": "AGENT_UNAVAILABLE"}), 503
             data = request.get_json(silent=True) or {}
-            user_id = data.get("user_id")
-            if not user_id:
-                return jsonify({"status": "FAILED"}), 400
-            if user_id not in SET_HOLDER_USERS:
-                return jsonify({"status": "REJECTED",
-                                "reason": "unknown user_id"})
-
-            user = db.get_user(user_id)
-            if not user or user["status"] != "JOINED":
-                return jsonify({"status": "REJECTED",
-                                "reason": "not joined yet"})
-            with self._lock:
-                if self._task_cracked:
-                    return jsonify({"status": "FAILED",
-                                    "reason": "TASK_CRACKED"}), 503
-                if not self._agents_available:
-                    return jsonify({"status": "FAILED",
-                                    "reason": "AGENT_UNAVAILABLE"}), 503
-                active = db.get_active_operation_by_user(user_id)
-                if active:
-                    if active["prot_type"] == "QUIT":
-                        return jsonify({"status": "ALREADY",
-                                        "op_id": active["op_id"]})
-                    else:
-                        return jsonify({"status": "CONFLICT",
-                                        "reason": f"user has active {active['prot_type']} operation"}), 409
-                pos = db.next_queue_pos()
-                op_id = db.create_operation(user_id, "QUIT", pos)
-            return jsonify({"status": "SUCCESSFUL", "op_id": op_id})
+            return _reserve_impl(data.get("user_id"), "QUIT", SET_HOLDER_USERS)
 
         # execute
+
+        def _check_biz_precondition(user_id: str, prot_type: str) -> str | None:
+            """Return rejection reason or None if precondition is met."""
+            user = db.get_user(user_id)
+            if not user:
+                return "unknown user_id"
+            if prot_type == "JOIN":
+                if user["status"] == "JOINED":
+                    return "already joined"
+            elif prot_type in ("UPDATE", "QUIT"):
+                if user["status"] != "JOINED":
+                    return "not joined yet"
+            return None
 
         @app.route("/execute", methods=["POST"])
         def execute():
             data = request.get_json(silent=True) or {}
-            op_id = data.get("op_id")
-            if not op_id:
+            user_id = data.get("user_id")
+            prot_type = data.get("prot_type")
+            op_id = data.get("op_id")  # optional, for internal pinning
+
+            if not user_id or not prot_type:
                 return jsonify({"status": "NOT_FOUND"}), 400
 
-            op = db.get_operation(op_id)
-            if not op:
-                return jsonify({"status": "NOT_FOUND"})
+            # ——— resolve operation ———
+            if op_id is not None:
+                # pinned: verify op_id still matches user+service
+                op = db.get_operation(op_id)
+                if not op or op["user_id"] != user_id or op["prot_type"] != prot_type:
+                    return jsonify({"status": "NOT_FOUND"})
+            else:
+                op = db.get_live_operation(user_id, prot_type)
+                if not op:
+                    return jsonify({"status": "NOT_RESERVED"})
+                op_id = op["op_id"]
 
-            user = db.get_user(op["user_id"])
-            if not user:
-                return jsonify({"status": "NOT_FOUND"})
-            role = user["role"]
-            prot_type = op["prot_type"]
-            if role == "set_holder" and prot_type not in ("JOIN", "UPDATE", "QUIT"):
-                return jsonify({"status": "REJECTED",
-                                "reason": "unauthorized"})
-            if role == "querier" and prot_type != "QUERY":
-                return jsonify({"status": "REJECTED",
-                                "reason": "unauthorized"})
-
-            # terminal states always take priority — preserve original error code
+            # ——— terminal states ———
             status = op["status"]
             if status == "DONE":
                 return jsonify({"status": "DONE"})
@@ -359,13 +279,27 @@ class C3ManageServer:
             if status == "REMOVED":
                 return jsonify({"status": "REMOVED"})
 
-            # only non-terminal work is blocked by crack
             if self._task_cracked:
                 return jsonify({"status": "FAILED",
                                 "reason": "TASK_CRACKED"}), 503
             if not self._agents_available:
                 return jsonify({"status": "FAILED",
                                 "reason": "AGENT_UNAVAILABLE"}), 503
+
+            # ——— RESERVED: enqueue + business check ———
+            if status == "RESERVED":
+                reason = _check_biz_precondition(user_id, prot_type)
+                if reason:
+                    return jsonify({"status": "REJECTED", "reason": reason})
+
+                with self._lock:
+                    # re-read in case of race
+                    op2 = db.get_operation(op_id)
+                    if op2["status"] == "RESERVED":
+                        db.enqueue_reserved(op_id)
+                    # fall through to re-read status below
+                    op = db.get_operation(op_id)
+                    status = op["status"]
 
             with self._lock:
                 if self._task_cracked:
@@ -378,42 +312,49 @@ class C3ManageServer:
                 status = op["status"]
 
                 if status == "QUEUED":
-                    db.touch_operation(op_id)  # client heartbeat
-                    activated = self._try_activate(op_id)
-                    if activated:
-                        op = db.get_operation(op_id)
-                        if op["status"] == "ACTIVE":
-                            return self._start_execute(op)
-                    pos = db.queue_position_of(op_id)
+                    db.touch_operation(op_id)
 
+                    # check again — a concurrent execute might have transitioned
+                    if op["status"] == "QUEUED":
+                        activated = self._try_activate(op_id)
+                        if activated:
+                            op = db.get_operation(op_id)
+                            if op["status"] == "ACTIVE":
+                                return self._start_execute(op)
+                    pos = db.queue_position_of(op_id)
                     active_op = db.get_active()
                     ahead = (pos - 1 if pos else 0) + (1 if active_op else 0)
                     retry_after = min(8.0, max(1.0, 1.5 * math.sqrt(ahead + 1)))
-
                     return jsonify({"status": "WAITING",
                                     "position": pos,
                                     "ahead": ahead,
-                                    "retry_after": round(retry_after, 1)})
+                                    "retry_after": round(retry_after, 1),
+                                    "_op_id": op_id})
 
                 if status == "ACTIVE":
                     return self._start_execute(op)
 
                 if status == "BUSY":
-                    cached = self._ports.get(op_id, {})
-                    return jsonify({"status": "BUSY",
-                                    "agents": {
-                                        "STEWARD": {
-                                            "ip": self._agent_ips["steward"],
-                                            "port": cached.get("STEWARD")},
-                                        "PEER0": {
-                                            "ip": self._agent_ips["peer0"],
-                                            "port": cached.get("PEER0")},
-                                        "PEER1": {
-                                            "ip": self._agent_ips["peer1"],
-                                            "port": cached.get("PEER1")},
-                                    }})
+                    # Only the caller whose _start_execute succeeded gets agents.
+                    # Subsequent callers see BUSY without agents.
+                    cached = self._ports.get(op_id)
+                    if cached:
+                        return jsonify({"status": "BUSY",
+                                        "agents": {
+                                            "STEWARD": {
+                                                "ip": self._agent_ips["steward"],
+                                                "port": cached["STEWARD"]},
+                                            "PEER0": {
+                                                "ip": self._agent_ips["peer0"],
+                                                "port": cached["PEER0"]},
+                                            "PEER1": {
+                                                "ip": self._agent_ips["peer1"],
+                                                "port": cached["PEER1"]},
+                                        }})
+                    return jsonify({"status": "BUSY"})
 
-                return jsonify({"status": "NOT_FOUND"})
+                return jsonify({"status": op["status"],
+                                "_op_id": op_id})
 
         return app
 

@@ -70,27 +70,34 @@ class C3SetHolder:
 
     # flow
     def reserve(self, prot_type: str) -> dict:
-        """Reserve only.  Returns the server response including op_id."""
-        resp = self._post(f"/reserve_{prot_type.lower()}",
+        return self._post(f"/reserve_{prot_type.lower()}",
                           {"user_id": self._user_id})
-        return resp
 
-    def execute(self, prot_type: str, op_id: str,
+    def execute(self, prot_type: str,
                 data_set: list[bytes] | None = None) -> dict:
-        """Execute with a previously-reserved op_id."""
+        """Poll /execute until DONE.  Pins internal _op_id after first call."""
+        internal_op_id = None
         protocol_started = False
+        tag = prot_type.lower()
         while True:
-            resp = self._post("/execute", {"op_id": op_id})
+            body = {"user_id": self._user_id, "prot_type": prot_type}
+            if internal_op_id is not None:
+                body["op_id"] = internal_op_id
+            resp = self._post("/execute", body)
             status = resp.get("status")
+            # pin internal op_id for subsequent polls
+            if "_op_id" in resp:
+                internal_op_id = resp["_op_id"]
 
             if status == "DONE":
                 return resp
-            if status in ("REMOVED", "FAILED", "NOT_FOUND"):
+            if status in ("REMOVED", "FAILED", "NOT_FOUND", "NOT_RESERVED"):
+                return resp
+            if status == "REJECTED":
                 return resp
             if status == "WAITING":
                 ahead = resp.get("ahead", 0)
                 delay = float(resp.get("retry_after", 1.0))
-                tag = prot_type.lower()
                 print(f"\r[{tag}] server: {ahead} task(s) ahead "
                       f"— retrying in {delay:.1f}s",
                       end="", flush=True)
@@ -108,110 +115,67 @@ class C3SetHolder:
                 if prot_type == "QUIT":
                     time.sleep(1)
                     continue
-                if not protocol_started:
+                agents = resp.get("agents")
+                if agents is not None and not protocol_started:
                     protocol_started = True
-                    tag = prot_type.lower()
                     print(f"\r[{tag}] executing protocol..."
                           + " " * 30)
-                    self.run_protocol(resp["agents"], data_set or [])
+                    self.run_protocol(agents, data_set or [])
                 time.sleep(1)
                 continue
             return resp
 
-    def _reserve_and_execute(self, prot_type: str,
-                             data_set: list[bytes] | None = None) -> dict:
-        resp = self.reserve(prot_type)
-        if resp.get("status") == "REJECTED":
-            return resp
-        if resp.get("status") == "CONFLICT":
-            return resp
-        if resp.get("status") not in ("SUCCESSFUL", "ALREADY"):
-            return resp
-        op_id = resp.get("op_id")
-        if not op_id:
-            return {"status": "FAILED", "reason": "no op_id in response"}
-        return self.execute(prot_type, op_id, data_set)
-
-    def join(self, data_set: list[bytes]) -> dict:
-        return self._reserve_and_execute("JOIN", data_set)
-
-    def update(self, data_set: list[bytes]) -> dict:
-        return self._reserve_and_execute("UPDATE", data_set)
-
-    def quit(self) -> dict:
-        return self._reserve_and_execute("QUIT")
-
     # CLI
+    @classmethod
+    def _load_dataset(cls, user_id: str) -> list[bytes] | None:
+        cfg_root = read_json(os.path.join(_APP_DIR, "config.json"))
+        storage_root = cfg_root["storage_root_dir"]
+        npy_path = os.path.join(_APP_DIR, storage_root,
+                                f"set_holder_{user_id}", "set.npy")
+        if not os.path.isfile(npy_path):
+            print(f"error: {npy_path} not found")
+            return None
+        arr = np.load(npy_path)
+        data_set = [str(x).encode() for x in arr]
+        print(f"[set_holder] loaded {len(data_set)} elements from {npy_path}")
+        return data_set
+
     @classmethod
     def run_cli(cls, args: list[str] | None = None) -> None:
         if args is None:
             args = []
 
-        if not args:
-            print("usage: python run.py set_holder <user_id> [-r | -e <op_id>]")
+        if len(args) < 3:
+            print("usage: python3 run.py set_holder -r <SERVICE> <user_id>")
+            print("       python3 run.py set_holder -e <SERVICE> <user_id>")
+            print("  SERVICE: JOIN | UPDATE | QUIT")
             return
 
-        mode = "full"  # full | reserve | execute
-        op_id = None
-        prot_type = "JOIN"  # JOIN | UPDATE | QUIT
+        flag = args[0]
+        if flag not in ("-r", "-e"):
+            print("error: must specify -r (reserve) or -e (execute)")
+            return
 
-        user_id = args[0]
-        i = 1
-        while i < len(args):
-            a = args[i]
-            if a == "-r":
-                mode = "reserve"
-                if i + 1 < len(args) and args[i + 1] in ("JOIN", "UPDATE", "QUIT"):
-                    prot_type = args[i + 1]
-                    i += 1
-                i += 1
-            elif a == "-e":
-                mode = "execute"
-                if i + 1 < len(args) and not args[i + 1].startswith("-"):
-                    op_id = args[i + 1]
-                    i += 2
-                else:
-                    print("usage: set_holder <user_id> -e <op_id> [JOIN|UPDATE|QUIT]")
-                    return
-            elif a in ("JOIN", "UPDATE", "QUIT"):
-                prot_type = a
-                i += 1
-            else:
-                i += 1
+        prot_type = args[1]
+        if prot_type not in ("JOIN", "UPDATE", "QUIT"):
+            print(f"error: unknown service '{prot_type}'")
+            return
 
-        if mode in ("full", "execute"):
-            if prot_type != "QUIT":
-                cfg_root = read_json(os.path.join(_APP_DIR, "config.json"))
-                storage_root = cfg_root["storage_root_dir"]
-                npy_path = os.path.join(_APP_DIR, storage_root,
-                                        f"set_holder_{user_id}", "set.npy")
-                if os.path.isfile(npy_path):
-                    arr = np.load(npy_path)
-                    data_set = [str(x).encode() for x in arr]
-                    print(f"[set_holder] loaded {len(data_set)} elements from {npy_path}")
-                else:
-                    print(f"error: {npy_path} not found")
-                    return
-            else:
-                data_set = None
-        else:
-            data_set = None
-
+        user_id = args[2]
         sh = cls(user_id)
 
-        if mode == "reserve":
+        if flag == "-r":
             result = sh.reserve(prot_type)
-        elif mode == "execute":
-            if op_id is None:
-                print("error: -e requires <op_id>")
-                return
-            result = sh.execute(prot_type, op_id, data_set)
-        else:
-            if prot_type == "JOIN":
-                result = sh.join(data_set=data_set)
-            elif prot_type == "UPDATE":
-                result = sh.update(data_set=data_set)
-            else:
-                result = sh.quit()
+            print(json.dumps(result, indent=2))
+            return
 
+        # -e: execute
+        if prot_type == "QUIT":
+            data_set = None
+        else:
+            data_set = cls._load_dataset(user_id)
+            if data_set is None:
+                return
+
+        result = sh.execute(prot_type, data_set=data_set)
         print(json.dumps(result, indent=2))
