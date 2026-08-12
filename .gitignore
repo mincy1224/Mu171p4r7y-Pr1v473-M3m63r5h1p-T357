@@ -17,5 +17,6 @@ application/storage
 application/pretreat/pre.json
 application/pretreat/querier_users.json
 application/pretreat/set_holder_users.json
+application/task_status.json
 
 es.txt
