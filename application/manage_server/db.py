@@ -1,4 +1,4 @@
-# draft
+
 """
 SQLite database layer — users + operations + tokens with FIFO queue.
 

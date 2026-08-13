@@ -1,4 +1,4 @@
-# draft
+
 """Read / write the task_status.json lifecycle file."""
 import json
 import os
