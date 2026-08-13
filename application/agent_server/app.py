@@ -3,10 +3,12 @@ import json
 import os
 import socket
 import threading
+import time
 
 import mpmt
 
 from _c3_io import ensure_dir, read_json
+from _c3_log import info, warn, error
 
 MAX_FRAME_BYTES = 1_048_576  # 1 MiB
 
@@ -82,6 +84,7 @@ class C3AgentServer:
         except Exception as e:
             self._send({"event": "ERROR", "user_id": user_id,
                         "msg": str(e), "request_id": request_id}, _gen=_send_gen)
+            raise  # let _run_cmd log the FAIL + duration
 
     def cmd_execute(self, user_id: str, prot_type: str,
                     request_id: str = "", _send_gen: int = 0,
@@ -185,8 +188,38 @@ class C3AgentServer:
                             "request_id": request_id}, _gen=_send_gen)
 
         except Exception as e:
+            error(self._role,
+                  f"protocol ERROR user={user_id} prot={prot_type} "
+                  f"rid={request_id}: {e!r}")
             self._send({"event": "ERROR", "user_id": user_id,
                         "msg": str(e), "request_id": request_id}, _gen=_send_gen)
+            raise  # let _run_cmd log the FAIL + duration
+        finally:
+            with self._exec_lock:
+                self._exec_thread = None
+
+    def cmd_sync(self, user_id: str = "", prot_type: str = "",
+                 request_id: str = "", _send_gen: int = 0,
+                 token: str = "") -> None:
+        """Manager-issued SYNC: run TreeCache.execute_merge in lockstep with
+        the other two Agents.  Reuses _exec_lock so it never overlaps a
+        JOIN/UPDATE/QUERY/QUIT protocol running on this Agent."""
+        with self._exec_lock:
+            if self._exec_thread is not None:
+                self._send({"event": "ERROR", "user_id": user_id,
+                            "msg": "agent busy (previous operation still running)",
+                            "request_id": request_id}, _gen=_send_gen)
+                return
+            self._exec_thread = threading.current_thread()
+        try:
+            self.prot_inst.sync_cache()
+            self._send({"event": "DONE", "user_id": user_id,
+                        "request_id": request_id}, _gen=_send_gen)
+        except Exception as e:
+            error(self._role, f"SYNC protocol error: {e!r}")
+            self._send({"event": "ERROR", "user_id": user_id,
+                        "msg": str(e), "request_id": request_id}, _gen=_send_gen)
+            raise  # let _run_cmd log the FAIL + duration
         finally:
             with self._exec_lock:
                 self._exec_thread = None
@@ -194,6 +227,7 @@ class C3AgentServer:
     _INSTRUCTIONS: dict[str, str] = {
         "RESERVE": "cmd_reserve",
         "EXECUTE": "cmd_execute",
+        "SYNC": "cmd_sync",
     }
 
     # network
@@ -202,12 +236,11 @@ class C3AgentServer:
         cfg_root = self._cfg_root
         role_cfg = self._cfg
 
-        print(f"[{self._role}] Agent starting up ...", flush=True)
+        info(self._role, "Agent starting up")
 
         # 1. Bind/listen on ch_prev_port — does NOT block
         listener = mpmt.ChannelListener(role_cfg["ip"], role_cfg["ch_prev_port"])
-        print(f"[{self._role}] listening on :{role_cfg['ch_prev_port']} ...",
-              flush=True)
+        info(self._role, f"listening on :{role_cfg['ch_prev_port']}")
 
         # 2. Connect to NEXT with retry
         attempt = 0
@@ -221,17 +254,16 @@ class C3AgentServer:
                 )
                 break
             except TimeoutError:
-                print(f"\r[{self._role}] waiting for {self._nxt_role} "
-                      f"(attempt {attempt}) ...",
-                      end="", flush=True)
-        print(f"\n[{self._role}] connected to {self._nxt_role}", flush=True)
+                info(self._role,
+                     f"waiting for {self._nxt_role} (attempt {attempt})")
+        info(self._role, f"connected to {self._nxt_role}")
 
         # 3. Accept from PREV
         ch_prev = listener.accept()
-        print(f"[{self._role}] accepted PREV", flush=True)
+        info(self._role, "accepted PREV")
 
         # 4. create AgentServer (TreeCache init)
-        print(f"[{self._role}] initialising TreeCache ...", flush=True)
+        info(self._role, "initialising TreeCache ...")
         preset = self._preset
         kwargs: dict = {
             "server_role": self._server_role,
@@ -247,15 +279,15 @@ class C3AgentServer:
             kwargs["hash_seed_list"] = [bytes.fromhex(h)
                                         for h in preset["hash_seed_list"]]
         self.prot_inst = mpmt.AgentServer(**kwargs)
-        print(f"[{self._role}] TreeCache initialised", flush=True)
+        info(self._role, "TreeCache initialised")
 
         # 5. start management listener
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((self._cfg["ip"], self._cfg["mgmt_port"]))
         srv.listen(1)
-        print(f"[{self._role}] management listening on "
-              f"{self._cfg['ip']}:{self._cfg['mgmt_port']}", flush=True)
+        info(self._role,
+             f"management listening on {self._cfg['ip']}:{self._cfg['mgmt_port']}")
 
         while True:
             self._conn, addr = srv.accept()
@@ -268,13 +300,13 @@ class C3AgentServer:
                     except OSError:
                         pass
                 self._reserved.clear()
-            print(f"[{self._role}] management connected from {addr}", flush=True)
+            info(self._role, f"management connected from {addr[0]}:{addr[1]}")
             try:
                 self._recv_loop()
             except (ConnectionError, OSError) as e:
-                print(f"[{self._role}] management disconnected: {e}", flush=True)
+                warn(self._role, f"management disconnected: {e}")
             except Exception as e:
-                print(f"[{self._role}] management error: {e}", flush=True)
+                error(self._role, f"management error: {e}")
 
     def _recv_loop(self) -> None:
         buf = b""
@@ -311,9 +343,30 @@ class C3AgentServer:
         self._send({"event": "READY", "user_id": user_id,
                     "request_id": request_id})
         method = getattr(self, method_name)
-        threading.Thread(target=method,
-                         args=(user_id, prot_type, request_id, gen, token),
+        threading.Thread(target=self._run_cmd,
+                         args=(name, method, user_id, prot_type,
+                               request_id, gen, token),
                          daemon=True).start()
+
+    def _run_cmd(self, name, method, user_id, prot_type,
+                 request_id, gen, token) -> None:
+        """Run one management command with BEGIN / DONE / FAIL logging
+        (command, outcome, duration)."""
+        who = f"rid={request_id}"
+        if user_id:
+            who += f" user={user_id[:8]}"
+        if prot_type:
+            who += f" prot={prot_type}"
+        t0 = time.monotonic()
+        info(self._role, f"BEGIN {name} {who}")
+        try:
+            method(user_id, prot_type, request_id, gen, token)
+        except Exception as e:
+            error(self._role, f"FAIL  {name} {who} "
+                              f"({time.monotonic() - t0:.3f}s): {e!r}")
+            return
+        info(self._role, f"DONE  {name} {who} "
+                         f"({time.monotonic() - t0:.3f}s)")
 
     def _send(self, msg: dict, *, _gen: int | None = None) -> None:
         with self._send_lock:
