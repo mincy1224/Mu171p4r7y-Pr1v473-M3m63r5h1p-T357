@@ -160,8 +160,7 @@ def run_protocol(params, seeds, rounds):
     ]
     ctx = mp.get_context("fork")
     barrier = ctx.Barrier(n_agents)
-    _mgr = mp.Manager()
-    q = _mgr.Queue()
+    q = ctx.Queue()
     procs = [ctx.Process(target=_agent_worker,
                          args=(pid, ring_ports, per_agent[pid], params, seeds,
                                barrier, q))
@@ -207,5 +206,4 @@ def run_protocol(params, seeds, rounds):
         for p in procs:
             if p.is_alive():
                 p.terminate()
-        _mgr.shutdown()
     return outcomes

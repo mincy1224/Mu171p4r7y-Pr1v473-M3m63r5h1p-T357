@@ -101,7 +101,8 @@ sudo apt-get install -y clang-15 cmake ninja-build \
 .github/install-deps.sh emp-sh2pc
 ```
 
-Then build and install the package:
+Then build and install the package (this also installs the Python runtime
+dependencies declared in `pyproject.toml` — `cloudpickle`, `flask`, `numpy`):
 
 ```bash
 pip install -e . -v

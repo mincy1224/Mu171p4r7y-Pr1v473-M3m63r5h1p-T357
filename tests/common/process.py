@@ -70,9 +70,13 @@ class Proc:
         return self.proc.poll() is None
 
     def send_stdin(self, line: str) -> None:
-        if self.proc.stdin is not None:
+        if self.proc.stdin is None or self.proc.poll() is not None:
+            return
+        try:
             self.proc.stdin.write((line + "\n").encode())
             self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
 
     def recent_log(self, n: int = 20) -> str:
         lines = list(self.lines)[-n:]

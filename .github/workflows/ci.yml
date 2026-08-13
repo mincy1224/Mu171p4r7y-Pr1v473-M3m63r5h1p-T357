@@ -64,11 +64,13 @@ jobs:
         if: steps.cache-emp-sh2pc.outputs.cache-hit != 'true'
         run: .github/install-deps.sh emp-sh2pc
 
-      # -- Python dependencies ----------------------------------
+      # -- Python build tools -----------------------------------
+      # Runtime deps (cloudpickle, flask, numpy) come from pyproject's
+      # `[project].dependencies` and are installed by `pip install -e .` below.
       - name: Install Python packages
         run: |
           pip install --upgrade pip
-          pip install 'nanobind>=2.13' scikit-build-core cloudpickle numpy
+          pip install 'nanobind>=2.13' scikit-build-core
 
       # -- Build mpmt -------------------------------------------
       - name: Build mpmt
