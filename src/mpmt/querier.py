@@ -1,6 +1,6 @@
 """
 Querier
-@author  mincy
+
 """
 
 from __future__ import annotations
@@ -43,9 +43,6 @@ class Querier:
         dr_share = rt_inst_peer1.recv_scalar()
 
         add2_inst_steward   = mpmt.ShrAdd2(ell=self._ell_root, party=0)(ch_steward)
-        # equality_test(a, b) checks (ALICE.a + BOB.a) == (ALICE.b + BOB.b).
-        # STEWARD contributes hf_num to the threshold; Querier contributes 0,
-        # so the total threshold is hf_num (not 2*hf_num).
         qr_share = add2_inst_steward.equality_test(dr_share, 0)
 
         return mpmt.ring_add(

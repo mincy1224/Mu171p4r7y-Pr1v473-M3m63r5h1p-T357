@@ -1,6 +1,6 @@
 //  BGI16 — Distributed Point Function.
 //
-//  @author  mincy
+//  
 //  @ref     Boyle et al. (https://eprint.iacr.org/2016/622)
 #ifndef DPF_BGI16_HPP
 #define DPF_BGI16_HPP
@@ -24,7 +24,6 @@
 #include "ideal_functionality/dpf.hpp"
 #include "rvector.hpp"
 
-/// @author artemis
 namespace scucse::crypto
 {
     template <uint64_t ELL_IN, uint64_t ELL_OUT> class Bgi16Base

@@ -1,6 +1,6 @@
 //  ABY3 — 3-party replicated secret sharing (RSS3).
 //
-//  @author  mincy
+//  
 //  @ref     ABY3 (Mohassel et al.), adapted for vectorized Rvector
 #ifndef ABY3_HPP
 #define ABY3_HPP

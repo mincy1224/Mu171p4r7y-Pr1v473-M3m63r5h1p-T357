@@ -1,4 +1,4 @@
-//  @author  mincy
+//  
 //  RingTransport — ring element send/recv over an IOChannel
 //
 //    ELL 1–8 :  send_vector / recv_vector  +  send_scalar / recv_scalar

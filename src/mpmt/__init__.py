@@ -1,5 +1,5 @@
 """MPMT — Multiparty Private Membership Test.
-@author  mincy
+
 """
 
 from mpmt import channels                                           # noqa: F401

@@ -3,7 +3,7 @@
 //
 //  SIMD nibble-packing inspired by Daniel Lemire's simdcomp library.
 //
-//  @author  mincy
+//  
 //  @ref     https://github.com/lemire/simdcomp
 #ifndef RVECTOR_HPP
 #define RVECTOR_HPP
@@ -67,13 +67,11 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
     ///
     /// Inspired by Daniel Lemire's simdcomp library
     /// (https://github.com/lemire/simdcomp)
-
-    // ====================================================================
     //  ELL = 4  pack  —  128-bit maddubs × 2  per 32 input bytes
     //  6 instructions / 32 bytes → 16 packed bytes
-    // ====================================================================
     inline size_t _pack4(const uint8_t* __restrict__ src, size_t n,
-                            uint8_t* __restrict__ dst) {
+                            uint8_t* __restrict__ dst) 
+    {
         const __m128i mul   = _mm_set1_epi32(0x10011001);
         const __m128i mask4 = _mm_set1_epi8(0x0F);
         size_t i = 0, out = 0;
@@ -100,11 +98,9 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         return out;
     }
 
-    // ====================================================================
     //  ELL = 4  unpack  —  _mm_cvtepu8_epi16 + interleave + streaming store
     //
     //  8 packed bytes → 16 output bytes via widen + interleave
-    // ====================================================================
     inline void _unpack4(const uint8_t* __restrict__ src, size_t n,
                             uint8_t* __restrict__ dst) {
         const __m128i m4 = _mm_set1_epi16(0x0F);
@@ -133,12 +129,10 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         if (i < n) dst[i]=src[in]&0xF;
     }
 
-    // ====================================================================
     //  ELL = 2  pack  —  _mm_maddubs_epi16 + _mm_hadd_epi16 + PSHUFB
     //                     + streaming stores
     //
     //  16 input bytes → 4 packed bytes, batched ×4 → 16 bytes streamed
-    // ====================================================================
     inline size_t _pack2(const uint8_t* __restrict__ src, size_t n,
                             uint8_t* __restrict__ dst) {
         const __m128i mul = _mm_set1_epi32(0x40100401);
@@ -148,7 +142,6 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
             0x80,0x80,0x80,0x80, 12,8,4,0);
         size_t i = 0, out = 0;
 
-        // 64 input elements → 16 packed bytes, streamed
         for (; i + 255 < n; i += 256) {
             for (int b = 0; b < 4; ++b, out += 16) {
                 alignas(16) uint8_t buf[16];
@@ -183,9 +176,7 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         return out;
     }
 
-    // ====================================================================
     //  ELL = 2  unpack  —  unrolled scalar, writes batched via streaming store
-    // ====================================================================
     inline void _unpack2(const uint8_t* __restrict__ src, size_t n,
                             uint8_t* __restrict__ dst) {
         size_t i = 0, in = 0;
@@ -222,8 +213,7 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
     //  Load N packed bytes into a 32/64-bit word, extract all values
     //  with compile-time shift+mask — no branches, no bit-accumulator.
     //  Group size = lcm(ELL, 8) / 8 elements per group.
-
-    // ——— ELL=3: 8 elements  3 bytes ———
+    //  ELL=3: 8 elements  3 bytes 
     inline size_t _pack3(const uint8_t* __restrict__ src, size_t n,
                             uint8_t* __restrict__ dst) {
         constexpr uint8_t M = 7;
@@ -278,7 +268,7 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         }
     }
 
-    // ——— ELL=5: 8 elements ↔ 5 bytes ———
+    //  ELL=5: 8 elements ↔ 5 bytes 
     inline size_t _pack5(const uint8_t* __restrict__ src, size_t n,
                             uint8_t* __restrict__ dst) {
         constexpr uint8_t M = 31;
@@ -337,7 +327,7 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         }
     }
 
-    // ——— ELL=6: 4 elements ↔ 3 bytes ———
+    //  ELL=6: 4 elements ↔ 3 bytes 
     inline size_t _pack6(const uint8_t* __restrict__ src, size_t n,
                             uint8_t* __restrict__ dst) {
         constexpr uint8_t M = 63;
@@ -385,7 +375,7 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         }
     }
 
-    // ——— ELL=7: 8 elements ↔ 7 bytes ———
+    //  ELL=7: 8 elements ↔ 7 bytes 
     inline size_t _pack7(const uint8_t* __restrict__ src, size_t n,
                             uint8_t* __restrict__ dst) {
         constexpr uint8_t M = 127;
@@ -752,7 +742,7 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
             return words_ * sizeof(word_t);
         }
 
-        // ——— file I/O ———
+        //  file I/O 
         // Format:  [uint32_t magic "MPMT"] [uint64_t ELL] [uint64_t n] [payload]
         // Extension: .mpmtrvp
 
@@ -1413,7 +1403,7 @@ bool operator!=(const AlignedAlloc<T, A>&, const AlignedAlloc<U, A>&) noexcept
         }
     }
 
-    // ——— pack / unpack free functions ———
+    //  pack / unpack free functions 
 
     template <uint64_t ELL>
     inline void packRvec(const Rvector<ELL>& src, RvectorPack& auxBuf)

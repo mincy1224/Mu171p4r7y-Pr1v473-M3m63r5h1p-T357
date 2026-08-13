@@ -1,6 +1,6 @@
 """ 
 Agent Server
-@author  mincy
+
 """
 
 from __future__ import annotations
@@ -153,7 +153,6 @@ class AgentServer:
             ),
         )
 
-    # ------------------------------------------------------------------
     # initialisation helpers
 
     def _init_step(self, name: str, factory):
@@ -179,7 +178,6 @@ class AgentServer:
             party=1,
         )(self._ch_nxt)
 
-    # ------------------------------------------------------------------
     # TreeCache merge primitive
 
     def _merge(self, *, sva, svb, svout):
@@ -195,7 +193,6 @@ class AgentServer:
             svout,
         )
 
-    # ------------------------------------------------------------------
     # set-holder protocol
 
     @overload

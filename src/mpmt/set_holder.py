@@ -1,6 +1,6 @@
 """
 SetHolder 
-@author  mincy
+
 """
 
 from __future__ import annotations

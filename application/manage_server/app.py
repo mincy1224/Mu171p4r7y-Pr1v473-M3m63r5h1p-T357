@@ -147,8 +147,8 @@ class C3ManageServer:
         self._agents_available = True
         self._started = False
         self._sync_counter = 0
-        self._sync_queue: list[int] = []        # 待执行 SYNC 的 sync_id（FIFO）
-        self._active_sync: dict | None = None   # 运行中的 SYNC {"sync_id","status"}
+        self._sync_queue: list[int] = []        # pending SYNC sync_ids (FIFO)
+        self._active_sync: dict | None = None   # running SYNC {"sync_id","status"}
         self._sync_lock = threading.Lock()
         self._app = self._create_app()
 

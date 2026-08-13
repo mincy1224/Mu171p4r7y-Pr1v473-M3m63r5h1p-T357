@@ -1,6 +1,6 @@
 //  Shared bind helpers — ELL ranges, for_range, type aliases.
 //
-//  @author  mincy
+//  
 #pragma once
 
 #include <cstdint>

@@ -1,6 +1,6 @@
 //  EMP2 — 2-party additive secret sharing (ADD2).
 //
-//  @author  mincy
+//  
 //  @ref     emp-toolkit (https://github.com/emp-toolkit/emp-tool)
 #ifndef EMP2_HPP
 #define EMP2_HPP

@@ -1,6 +1,6 @@
 """Bloom filter parameter calculation.
 
-@author  mincy
+
 """
 
 import math

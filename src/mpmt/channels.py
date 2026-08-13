@@ -1,5 +1,7 @@
 """Persistent TCP channels wrapping ``emp::NetIO``.
 
+
+
 ``Channel(sock)`` — wrap an already-connected Python socket.
 ``Channel.connect(host, port, timeout=None)`` — connect with retry.
 ``ChannelListener(host, port)`` — server-side bind/listen.
@@ -8,7 +10,7 @@
 All TCP connection establishment is handled by Python's ``socket`` module.
 NetIO only receives already-connected sockets via ``NetIO_from_socket``.
 
-@author  mincy
+
 @ref     emp::NetIO from emp-toolkit (https://github.com/emp-toolkit/emp-tool)
 """
 

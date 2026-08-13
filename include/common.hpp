@@ -50,7 +50,7 @@ namespace scucse::crypto::math
         }
     }
 
-    // ———  32-bit (ELL ≤ 32)  ———
+    //   32-bit (ELL ≤ 32)  
 
     template <uint64_t ELL>
     inline constexpr uint32_t RING_MASK32 =
@@ -168,7 +168,7 @@ namespace scucse::crypto
         return h32;
     }
 
-    // — hex encode / decode helpers (used by Bgi16 KeyType JSON serialization) —
+    // hex encode / decode helpers (used by Bgi16 KeyType JSON serialization)
 
     inline constexpr char HEX_CHARS[] = "0123456789abcdef";
 
