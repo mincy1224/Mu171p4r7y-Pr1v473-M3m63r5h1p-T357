@@ -38,7 +38,7 @@ The project provides two parts:
 The diagram above shows the overall architecture. The lower three layers are bundled in the `mpmt` package, which contains the reusable MPMT protocol implementations and can be used independently of this project's application layer. It exposes MPC building blocks and the high-level protocol objects the application uses through a Python interface; the low level is a C++20 core bound to Python with nanobind.
 
 Basic examples and protocol-level usage are in [`tutorial/`](./tutorial/):
-- [`tutorial/README.md`](./tutorial/README.md) — Python interface overview;
+- [`tutorial/prot.md`](./tutorial/prot.md) — SetHolder / Querier / AgentServer protocols and TreeCache;
 - [`tutorial/base/`](./tutorial/base/) — basic data structures and ring operations;
 - [`tutorial/building_blocks/`](./tutorial/building_blocks/) — MPC building blocks;
 - [`tutorial/net/`](./tutorial/net/) — communication Channels and network transport.
