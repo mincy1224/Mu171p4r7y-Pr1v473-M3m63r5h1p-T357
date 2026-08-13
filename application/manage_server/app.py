@@ -1,15 +1,33 @@
 # draft
+import atexit
 import json
+import logging
 import math
 import os
+import readline
 import socket
+import sys
 import threading
 import time
 
 from flask import Flask, request, jsonify
+from werkzeug.serving import make_server
 from _c3_io import read_json
 from _c3_task_status import write as write_task_status
+from _c3_log import debug, info, warn, error, tail, set_prompt
 from .db import db
+
+# The interactive control panel owns stdout; silence the WSGI dev server so its
+# startup banner / request logs do not pollute the c3-manager> prompt.
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+# Up/down arrow command history for the control panel, persisted to ~/.
+_HISTORY_FILE = os.path.expanduser("~/.c3_manager_history")
+try:
+    readline.read_history_file(_HISTORY_FILE)
+except (OSError, ValueError):
+    pass
+atexit.register(readline.write_history_file, _HISTORY_FILE)
 
 _APP_DIR = os.path.join(os.path.dirname(__file__), "..")
 
@@ -47,7 +65,7 @@ class AgentManager:
         s.connect((ac["ip"], ac["mgmt_port"]))
         self._conns[role] = s
         self._bufs[role] = b""
-        print(f"[manage] connected to {role} at {ac['ip']}:{ac['mgmt_port']}", flush=True)
+        info("manage", f"connected to {role} at {ac['ip']}:{ac['mgmt_port']}")
 
     def reconnect(self, role: str) -> None:
         """Public: reconnect a dropped Agent."""
@@ -86,19 +104,20 @@ class C3ManageServer:
         cfg = read_json(os.path.join(_dir, "..", "config.json"))
         self._cfg = cfg["manage_server"]
         self._timeout = cfg["timeout"]
+        self._protocol_timeout = float(cfg.get("protocol_timeout", 180.0))
         self._queue_lease_timeout = cfg.get("queue_lease_timeout", 120)
 
-        print("[manage] Manager starting up ...", flush=True)
+        info("manage", "Manager starting up ...")
 
         # seed users from pretreat into DB
         pretreat_dir = os.path.join(_dir, "..", "pretreat")
         db.seed_users(pretreat_dir)
-        print("[manage] DB seeded from pretreat", flush=True)
+        info("manage", "DB seeded from pretreat")
 
         # reconcile ACTIVE/BUSY operations left over from a previous crash
         result = db.reconcile_on_startup()
         if result["count"]:
-            print(f"[manage] reconciled {result['count']} stale operation(s) → FAILED", flush=True)
+            info("manage", f"reconciled {result['count']} stale operation(s) → FAILED")
         if result["uncertain"]:
             write_task_status(
                 "cracked",
@@ -126,6 +145,11 @@ class C3ManageServer:
         self._lock = threading.Lock()
         self._task_cracked = False
         self._agents_available = True
+        self._started = False
+        self._sync_counter = 0
+        self._sync_queue: list[int] = []        # 待执行 SYNC 的 sync_id（FIFO）
+        self._active_sync: dict | None = None   # 运行中的 SYNC {"sync_id","status"}
+        self._sync_lock = threading.Lock()
         self._app = self._create_app()
 
     def _next_request_id(self) -> str:
@@ -141,7 +165,7 @@ class C3ManageServer:
                 self._agents.reconnect(role)
             except Exception as e:
                 ok = False
-                print(f"[manage] reconnect {role} failed: {e}")
+                warn("manage", f"reconnect {role} failed: {e}")
         self._agents_available = ok
         return ok
 
@@ -151,18 +175,19 @@ class C3ManageServer:
         No self-recovery — cracked requires full process restart + pretreat."""
         with self._lock:
             self._task_cracked = True
-        try:
-            db.fail_operation(op_id, error_code)
-        except Exception as e:
-            print(f"[manage] fail_operation error: {e}")
+        if op_id is not None:
+            try:
+                db.fail_operation(op_id, error_code)
+            except Exception as e:
+                warn("manage", f"fail_operation error: {e}")
         try:
             write_task_status("cracked", info or f"{error_code}: op_id={op_id}")
         except Exception as e:
-            print(f"[manage] write_task_status error: {e}")
+            warn("manage", f"write_task_status error: {e}")
         try:
             db.fail_all_live_operations("TASK_CRACKED")
         except Exception as e:
-            print(f"[manage] fail_all_live_operations error: {e}")
+            warn("manage", f"fail_all_live_operations error: {e}")
         self._ports.clear()
 
     # Flask app
@@ -182,11 +207,9 @@ class C3ManageServer:
             with self._lock:
                 live = db.get_live_operation(user_id, prot_type)
                 if live:
-                    return jsonify({"status": "ALREADY",
-                                    "_op_id": live["op_id"]})
-                op_id = db.create_reserved_operation(user_id, prot_type)
-                return jsonify({"status": "SUCCESSFUL",
-                                "_op_id": op_id})
+                    return jsonify({"status": "ALREADY"})
+                db.create_reserved_operation(user_id, prot_type)
+                return jsonify({"status": "SUCCESSFUL"})
 
         @app.route("/reserve_join", methods=["POST"])
         def reserve_join():
@@ -272,12 +295,13 @@ class C3ManageServer:
             # ——— terminal states ———
             status = op["status"]
             if status == "DONE":
-                return jsonify({"status": "DONE"})
+                return jsonify({"status": "DONE", "_op_id": op_id})
             if status == "FAILED":
                 return jsonify({"status": "FAILED",
-                                "reason": op.get("error_code", "unknown")})
+                                "reason": op.get("error_code", "unknown"),
+                                "_op_id": op_id})
             if status == "REMOVED":
-                return jsonify({"status": "REMOVED"})
+                return jsonify({"status": "REMOVED", "_op_id": op_id})
 
             if self._task_cracked:
                 return jsonify({"status": "FAILED",
@@ -290,7 +314,8 @@ class C3ManageServer:
             if status == "RESERVED":
                 reason = _check_biz_precondition(user_id, prot_type)
                 if reason:
-                    return jsonify({"status": "REJECTED", "reason": reason})
+                    return jsonify({"status": "REJECTED", "reason": reason,
+                                    "_op_id": op_id})
 
                 with self._lock:
                     # re-read in case of race
@@ -335,23 +360,10 @@ class C3ManageServer:
                     return self._start_execute(op)
 
                 if status == "BUSY":
-                    # Only the caller whose _start_execute succeeded gets agents.
-                    # Subsequent callers see BUSY without agents.
-                    cached = self._ports.get(op_id)
-                    if cached:
-                        return jsonify({"status": "BUSY",
-                                        "agents": {
-                                            "STEWARD": {
-                                                "ip": self._agent_ips["steward"],
-                                                "port": cached["STEWARD"]},
-                                            "PEER0": {
-                                                "ip": self._agent_ips["peer0"],
-                                                "port": cached["PEER0"]},
-                                            "PEER1": {
-                                                "ip": self._agent_ips["peer1"],
-                                                "port": cached["PEER1"]},
-                                        }})
-                    return jsonify({"status": "BUSY"})
+                    # Agents are only returned ONCE by _start_execute().
+                    # All subsequent BUSY polls get no agents — this prevents
+                    # duplicate executors from connecting to the same Agent ports.
+                    return jsonify({"status": "BUSY", "_op_id": op_id})
 
                 return jsonify({"status": op["status"],
                                 "_op_id": op_id})
@@ -359,7 +371,7 @@ class C3ManageServer:
         return app
 
     def _start_execute(self, op: dict):
-        """Transition ACTIVE → BUSY, spawn protocol thread, return ports."""
+        """Transition ACTIVE → BUSY, spawn protocol thread, return agents ONCE."""
         op_id = op["op_id"]
         prot_type = op["prot_type"]
         user_id = op["user_id"]
@@ -369,19 +381,20 @@ class C3ManageServer:
             threading.Thread(target=self._run_execute,
                              args=(op_id, user_id, prot_type),
                              daemon=True).start()
-            return jsonify({"status": "BUSY"})
+            return jsonify({"status": "BUSY", "_op_id": op_id})
 
         ports = self._reserve_ports(op_id, user_id, prot_type)
         if ports is None:
             db.fail_operation(op_id, "RESERVE_FAILED")
-            return jsonify({"status": "FAILED", "reason": "reserve_ports"})
+            return jsonify({"status": "FAILED", "reason": "reserve_ports",
+                            "_op_id": op_id})
 
         self._ports[op_id] = ports
         db.update_operation(op_id, "BUSY")
         threading.Thread(target=self._run_execute,
                          args=(op_id, user_id, prot_type),
                          daemon=True).start()
-        return jsonify({"status": "BUSY",
+        return jsonify({"status": "BUSY", "_op_id": op_id,
                         "agents": {
                             "STEWARD": {
                                 "ip": self._agent_ips["steward"],
@@ -473,7 +486,7 @@ class C3ManageServer:
 
     def _run_execute(self, op_id: int, user_id: str, prot_type: str):
         req_id = self._next_request_id()
-        deadline = time.monotonic() + self._timeout
+        ready_deadline = time.monotonic() + self._timeout
 
         # --- preflight: verify all tokens present for UPDATE/QUIT ---
         agent_tokens: dict[str, str] = {}
@@ -488,6 +501,8 @@ class C3ManageServer:
 
         # --- send EXECUTE to all three ---
         # Once EXECUTE is sent, any failure here is UNCERTAIN → cracked.
+        op_started = time.monotonic()
+        info("manage", f"{prot_type} op={op_id} dispatch")
         try:
             for role in ("STEWARD", "PEER0", "PEER1"):
                 msg = {"request_id": req_id,
@@ -497,16 +512,19 @@ class C3ManageServer:
                 if prot_type in ("UPDATE", "QUIT"):
                     msg["token"] = agent_tokens[role]
                 self._agents.send(role, msg)
-        except (OSError, ConnectionError):
+        except (OSError, ConnectionError) as e:
+            error("manage", f"{prot_type} op={op_id} EXECUTE dispatch failed: {e}")
             self._crack_task(op_id, "AGENT_DISCONNECTED",
                 f"EXECUTE dispatch uncertain: op={op_id} user={user_id}")
             return
 
-        # --- collect READY acks (per-recv deadline timeout) ---
+        # --- collect READY acks (per-recv deadline: self._timeout) ---
         ready_ok = True
         for role in ("STEWARD", "PEER0", "PEER1"):
-            remaining = deadline - time.monotonic()
+            remaining = ready_deadline - time.monotonic()
             if remaining <= 0:
+                debug("manage", f"{prot_type} op={op_id} {role} READY deadline "
+                      f"exceeded")
                 ready_ok = False
                 break
             self._agents.settimeout(role, min(self._timeout, max(0.1, remaining)))
@@ -514,7 +532,9 @@ class C3ManageServer:
             for _ in range(self._MAX_SKIP):
                 try:
                     ack = self._agents.recv(role)
-                except (ConnectionError, socket.timeout):
+                except (ConnectionError, socket.timeout) as e:
+                    debug("manage", f"{prot_type} op={op_id} {role} READY "
+                          f"recv error: {e}")
                     ready_ok = False
                     try:
                         self._agents.reconnect(role)
@@ -523,33 +543,50 @@ class C3ManageServer:
                     break
                 if ack.get("request_id") == req_id:
                     break
+                debug("manage", f"{prot_type} op={op_id} {role} discarding stale "
+                      f"msg rid={ack.get('request_id')} event={ack.get('event')}")
             else:
+                debug("manage", f"{prot_type} op={op_id} {role} READY skip "
+                      f"limit exhausted")
                 ready_ok = False
             if not ready_ok:
                 break
             if ack.get("event") != "READY":
+                debug("manage", f"{prot_type} op={op_id} {role} expected READY, "
+                      f"got {ack.get('event')}: {ack}")
                 ready_ok = False
                 break
 
         if not ready_ok:
+            error("manage", f"{prot_type} op={op_id} READY failed — cracking task")
             self._crack_task(op_id, "EXECUTE_READY_FAILED",
                 f"READY not received from all agents: op={op_id}")
             return
+        debug("manage", f"{prot_type} op={op_id} all READY received")
 
-        # --- collect terminal events from all three agents (per-recv deadline) ---
+        # --- collect terminal events (deadline: self._protocol_timeout) ---
+        protocol_deadline = time.monotonic() + self._protocol_timeout
+        debug("manage", f"{prot_type} op={op_id} waiting terminal events "
+              f"timeout={self._protocol_timeout}s")
         tokens: dict[str, str] = {}
         all_done = True
         for role in ("STEWARD", "PEER0", "PEER1"):
-            remaining = deadline - time.monotonic()
+            remaining = protocol_deadline - time.monotonic()
             if remaining <= 0:
+                debug("manage", f"{prot_type} op={op_id} terminal deadline "
+                      f"exceeded before {role}")
                 all_done = False
                 break
-            self._agents.settimeout(role, min(self._timeout, max(0.1, remaining)))
+            debug("manage", f"{prot_type} op={op_id} waiting terminal from "
+                  f"{role}, remaining={remaining:.1f}s")
+            self._agents.settimeout(role, max(0.1, remaining))
             event = None
             for _ in range(self._MAX_SKIP):
                 try:
                     event = self._agents.recv(role)
-                except (ConnectionError, socket.timeout):
+                except (ConnectionError, socket.timeout) as e:
+                    debug("manage", f"{prot_type} op={op_id} {role} terminal "
+                          f"recv FAILED: {type(e).__name__}: {e}")
                     all_done = False
                     try:
                         self._agents.reconnect(role)
@@ -559,10 +596,17 @@ class C3ManageServer:
                 if event.get("request_id") == req_id:
                     break
             else:
+                debug("manage", f"{prot_type} op={op_id} {role} terminal "
+                      f"skip limit exhausted")
                 all_done = False
             if not all_done:
                 break
-            if event.get("event") != "DONE":
+            ev = event.get("event")
+            debug("manage", f"{prot_type} op={op_id} {role} terminal event={ev}")
+            if ev == "ERROR":
+                debug("manage", f"{prot_type} op={op_id} {role} ERROR: "
+                      f"{event.get('msg', '')}")
+            if ev != "DONE":
                 all_done = False
                 break
             tok = event.get("agent_token", "")
@@ -570,6 +614,8 @@ class C3ManageServer:
                 tokens[role] = tok
 
         if not all_done:
+            error("manage", f"{prot_type} op={op_id} terminal collection "
+                  f"failed — cracking task")
             self._crack_task(op_id, "PROTOCOL_FAILED",
                 f"{prot_type} protocol incomplete: op={op_id} user={user_id}")
             return
@@ -599,6 +645,8 @@ class C3ManageServer:
             except Exception as e:
                 self._crack_task(op_id, "DB_COMMIT_FAILED",
                     f"{prot_type} completed on agents but DB update failed: {e}")
+        info("manage", f"{prot_type} op={op_id} DONE "
+                       f"({time.monotonic() - op_started:.3f}s)")
 
     # queue
 
@@ -623,31 +671,257 @@ class C3ManageServer:
         """Promote *op_id* QUEUED → ACTIVE only if it is at the head of the queue
         and no other operation is ACTIVE/BUSY.  Returns True on success."""
         if self._task_cracked:
+            debug("manage", "_try_activate: task cracked")
             return False
-        if db.get_active() is not None:
+        with self._sync_lock:
+            if self._sync_queue or self._active_sync is not None:
+                debug("manage", "_try_activate: SYNC has priority, defer business op")
+                return False
+        active = db.get_active()
+        if active is not None:
+            debug("manage", f"_try_activate: already active op={active['op_id']}")
             return False
         self._evict_stale_queue_heads()
         first = db.first_queued()
         if first is None:
+            debug("manage", f"_try_activate: no queued ops (op={op_id})")
             return False
         if first["op_id"] != op_id:
+            debug("manage", f"_try_activate: op={op_id} not first "
+                  f"(first={first['op_id']})")
             return False
+        debug("manage", f"_try_activate: promoting op={op_id}")
         db.promote_first_queued()
         return True
 
     # run
 
-    def run(self):
-        print(f"[manage] trying to connect to agents ...", flush=True)
-        self._reconnect_all()
-        if self._agents_available:
-            print("[manage] all agents connected", flush=True)
+    def run(self) -> None:
+        """CLI-first entry point.  Shows an interactive control panel and only
+        boots the backend (Agent connections + HTTP + scheduler) after the
+        operator types ``ms start``."""
+        print("c3-manager>  control panel. 'ms start' to begin serving, "
+              "'help' for commands.", flush=True)
+        while True:
+            set_prompt("c3-manager> ", use_readline=sys.stdin.isatty())
+            try:
+                line = input("c3-manager> ")
+            except EOFError:
+                set_prompt(None)
+                break          # stdin closed → keep already-started services alive
+            set_prompt(None)
+            self._handle_command(line.strip())
+        while True:            # daemon threads (HTTP / scheduler) keep serving
+            time.sleep(3600)
+
+    def _handle_command(self, cmd: str) -> None:
+        if not cmd:
+            return
+        if cmd == "ms start":
+            self._cmd_start()
+        elif cmd == "ms status":
+            self._cmd_status()
+        elif cmd == "ms sync":
+            self._cmd_sync()
+        elif cmd == "ms log":
+            self._cmd_log()
+        elif cmd in ("ms exit", "exit", "quit"):
+            info("manage", "manager exit requested")
+            sys.exit(0)
+        elif cmd == "help":
+            self._console_help()
         else:
-            print("[manage] WARNING: some agents are not reachable — "
-                  "requests will get AGENT_UNAVAILABLE until agents start", flush=True)
-        print(f"[manage] listening on http://{self._cfg['server_ip']}:{self._cfg['http_port']}", flush=True)
-        self._app.run(host=self._cfg['server_ip'],
-                      port=self._cfg['http_port'], debug=False)
+            warn("manage", f"unknown command: {cmd!r} (type 'help')")
+
+    def _cmd_start(self) -> None:
+        """Boot the backend once.  Idempotent: a second ``ms start`` only
+        reports already-started — no re-connect, no duplicate HTTP."""
+        if self._started:
+            info("manage", "already started")
+            return
+        self._reconnect_all()
+        threading.Thread(target=self._http_serve, daemon=True).start()
+        threading.Thread(target=self._scheduler_loop, daemon=True).start()
+        self._started = True
+        info("manage", "manager started (HTTP + scheduler)")
+        self._cmd_status()
+
+    def _http_serve(self) -> None:
+        """Serve the Flask app with werkzeug's make_server (no startup banner),
+        so the interactive control panel keeps a clean prompt."""
+        try:
+            srv = make_server(self._cfg["server_ip"], self._cfg["http_port"],
+                              self._app, threaded=True)
+        except OSError as e:
+            error("manage", f"HTTP server failed to start on "
+                            f"{self._cfg['server_ip']}:{self._cfg['http_port']}: {e}")
+            return
+        srv.serve_forever()
+
+    _DOT_RED = "\033[31m●\033[0m"
+    _DOT_GREEN = "\033[32m●\033[0m"
+
+    def _cmd_status(self) -> None:
+        """Show backend start state + per-Agent connection (red/green dot)."""
+        print(f"backend: {'started' if self._started else 'not started'}   "
+              f"task: {'CRACKED' if self._task_cracked else 'ok'}", flush=True)
+        for role in ("STEWARD", "PEER0", "PEER1"):
+            conn = self._agents._conns.get(role)
+            up = conn is not None and conn.fileno() >= 0
+            print(f"  {self._DOT_GREEN if up else self._DOT_RED} {role:<7} "
+                  f"{'connected' if up else 'not connected'}", flush=True)
+
+    def _cmd_sync(self) -> None:
+        """Queue an internal SYNC task ahead of all waiting business ops.
+        At most one SYNC may exist (queued or running) at a time; a second
+        ``ms sync`` is refused with a reason."""
+        if not self._started:
+            warn("manage", "SYNC refused: run 'ms start' first")
+            return
+        if self._task_cracked:
+            warn("manage", "SYNC refused: task is cracked")
+            return
+        with self._sync_lock:
+            if self._sync_queue or self._active_sync is not None:
+                if self._active_sync is not None:
+                    detail = (f"a SYNC is already running "
+                              f"(sync_id={self._active_sync['sync_id']})")
+                else:
+                    detail = (f"a SYNC is already queued "
+                              f"(sync_id={self._sync_queue[0]})")
+                warn("manage", f"SYNC refused: {detail}")
+                return
+            self._sync_counter += 1
+            sync_id = self._sync_counter
+            self._sync_queue.append(sync_id)
+        if not self._agents_available:
+            warn("manage", f"SYNC {sync_id} queued but agents unreachable — "
+                           "will be deferred")
+        info("manage", f"SYNC queued (sync_id={sync_id})")
+
+    def _cmd_log(self) -> None:
+        """Print the most recent log lines captured by _c3_log."""
+        for line in tail(50):
+            print(line, flush=True)
+
+    def _console_help(self) -> None:
+        print("commands:", flush=True)
+        print("  ms start   begin serving (connect Agents, start HTTP + scheduler)", flush=True)
+        print("  ms status  show backend state and Agent connections (●/●)", flush=True)
+        print("  ms sync    queue a TreeCache merge (runs after the current op)", flush=True)
+        print("  ms log     show recent log lines", flush=True)
+        print("  ms exit    stop the manager", flush=True)
+        print("  help       this list", flush=True)
+
+    def _scheduler_loop(self) -> None:
+        """Background SYNC dispatcher.  Shares the global single-active
+        scheduler with business operations: a SYNC only starts when no
+        business op is ACTIVE/BUSY and no other SYNC is running."""
+        while True:
+            time.sleep(0.25)
+            if self._task_cracked or not self._started:
+                continue
+            if not self._agents_available:
+                continue
+            do_sync, sync_id = False, None
+            with self._lock:           # same lock as business activation
+                if self._task_cracked or db.get_active() is not None:
+                    continue
+                with self._sync_lock:
+                    if self._active_sync is None and self._sync_queue:
+                        sync_id = self._sync_queue.pop(0)
+                        self._active_sync = {"sync_id": sync_id, "status": "ACTIVE"}
+                        do_sync = True
+            if do_sync:
+                threading.Thread(target=self._run_sync, args=(sync_id,),
+                                 daemon=True).start()
+
+    def _run_sync(self, sync_id: int) -> None:
+        """Dispatch a SYNC to all three Agents and wait for every DONE.
+        Any failure once SYNC is in flight is protocol-state-uncertain →
+        crack (no distributed rollback)."""
+        req_id = self._next_request_id()
+        ready_deadline = time.monotonic() + self._timeout
+        try:
+            with self._sync_lock:
+                if self._active_sync is not None:
+                    self._active_sync["status"] = "BUSY"
+            try:
+                for role in ("STEWARD", "PEER0", "PEER1"):
+                    self._agents.send(role, {"request_id": req_id, "cmd": "SYNC"})
+            except (OSError, ConnectionError) as e:
+                self._crack_task(None, "SYNC_DISPATCH_FAILED",
+                    f"SYNC dispatch uncertain: sync_id={sync_id}: {e}")
+                return
+
+            ready_ok = True
+            for role in ("STEWARD", "PEER0", "PEER1"):
+                remaining = ready_deadline - time.monotonic()
+                if remaining <= 0:
+                    ready_ok = False
+                    break
+                self._agents.settimeout(role, min(self._timeout, max(0.1, remaining)))
+                ack = None
+                for _ in range(self._MAX_SKIP):
+                    try:
+                        ack = self._agents.recv(role)
+                    except (ConnectionError, socket.timeout) as e:
+                        ready_ok = False
+                        try:
+                            self._agents.reconnect(role)
+                        except Exception:
+                            pass
+                        break
+                    if ack.get("request_id") == req_id:
+                        break
+                else:
+                    ready_ok = False
+                if not ready_ok:
+                    break
+                if ack.get("event") != "READY":
+                    ready_ok = False
+                    break
+            if not ready_ok:
+                self._crack_task(None, "SYNC_READY_FAILED",
+                    f"SYNC READY not received from all agents: sync_id={sync_id}")
+                return
+
+            protocol_deadline = time.monotonic() + self._protocol_timeout
+            all_done = True
+            for role in ("STEWARD", "PEER0", "PEER1"):
+                remaining = protocol_deadline - time.monotonic()
+                if remaining <= 0:
+                    all_done = False
+                    break
+                self._agents.settimeout(role, max(0.1, remaining))
+                event = None
+                for _ in range(self._MAX_SKIP):
+                    try:
+                        event = self._agents.recv(role)
+                    except (ConnectionError, socket.timeout) as e:
+                        all_done = False
+                        try:
+                            self._agents.reconnect(role)
+                        except Exception:
+                            pass
+                        break
+                    if event.get("request_id") == req_id:
+                        break
+                else:
+                    all_done = False
+                if not all_done:
+                    break
+                if event.get("event") != "DONE":
+                    all_done = False
+                    break
+            if not all_done:
+                self._crack_task(None, "SYNC_PROTOCOL_FAILED",
+                    f"SYNC protocol incomplete: sync_id={sync_id}")
+                return
+            info("manage", f"SYNC {sync_id} complete")
+        finally:
+            with self._sync_lock:
+                self._active_sync = None
 
 
 def run():
