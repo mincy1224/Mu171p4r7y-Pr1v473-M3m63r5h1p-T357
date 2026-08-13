@@ -6,7 +6,6 @@ Agent Server
 from __future__ import annotations
 
 from enum import IntEnum
-import time
 from typing import Literal, overload
 
 import mpmt
@@ -42,7 +41,6 @@ class AgentServer:
         ch_nxt,
         hash_seed_list: list[bytes] | None = None,
         cores: int,
-        debug_init: bool = True,
     ):
         if not isinstance(server_role, ServerRole):
             raise TypeError(
@@ -84,7 +82,6 @@ class AgentServer:
                 "hash_seed_list is only valid when server_role is STEWARD"
             )
 
-        self._debug_init = bool(debug_init)
         self._cores = cores
         self._server_role = server_role
         self._ch_prev = ch_prev
@@ -102,15 +99,6 @@ class AgentServer:
                     f"self._hf_num={self._hf_num}, "
                     f"len(hash_seed_list)={len(self._hash_seed_list)}"
                 )
-
-        self._log(
-            "parameters: "
-            f"bf_size={self._bf_size}, "
-            f"ell_add2={self._ell_add2}, "
-            f"hf_num={self._hf_num}, "
-            f"ell_root={self._ell_root}, "
-            f"cores={self._cores}"
-        )
 
         # IMPORTANT:
         # Do not insert any custom barrier/handshake here.  ShrRep3 itself
@@ -165,33 +153,11 @@ class AgentServer:
             ),
         )
 
-        self._log("initialisation complete")
-
     # ------------------------------------------------------------------
     # initialisation helpers
 
-    def _log(self, message: str) -> None:
-        if self._debug_init:
-            print(
-                f"[mpmt.AgentServer:{self._server_role.name}] {message}",
-                flush=True,
-            )
-
     def _init_step(self, name: str, factory):
-        start = time.monotonic()
-        self._log(f"BEGIN {name}")
-        try:
-            result = factory()
-        except Exception as exc:
-            elapsed = time.monotonic() - start
-            self._log(
-                f"FAILED {name} after {elapsed:.3f}s: "
-                f"{type(exc).__name__}: {exc}"
-            )
-            raise
-        elapsed = time.monotonic() - start
-        self._log(f"DONE  {name} ({elapsed:.3f}s)")
-        return result
+        return factory()
 
     def _build_dpf(self):
         if self._server_role is ServerRole.STEWARD:
@@ -221,11 +187,11 @@ class AgentServer:
         self._rep3_inst_ell1.hadamard(
             sva,
             svb,
-            self._pack_buf,
+            self._merge_buf,
         )
         self._rep3_inst_ell1.sub_vec(
             svout,
-            self._pack_buf,
+            self._merge_buf,
             svout,
         )
 
@@ -273,8 +239,6 @@ class AgentServer:
                 f"got {type(prot_type).__name__}"
             )
 
-        # QUIT has no set-holder data channel, but it still changes the
-        # TreeCache and therefore must finish the cache merge before success.
         if prot_type is ProtType.QUIT:
             if token is None:
                 raise TypeError("QUIT requires keyword argument 'token'")
@@ -285,7 +249,6 @@ class AgentServer:
                 )
 
             self._tc.remove(del_token=token)
-            self._tc.execute_merge()
             return None
 
         if ch_set_holder is None:
@@ -306,14 +269,14 @@ class AgentServer:
         # Receive the new Bloom-filter share.
         if self._server_role is ServerRole.STEWARD:
             rt_inst = mpmt.RingTransport(ell=1)(ch_set_holder)
-            for share in (
+            rt_inst.recv_vector(
                 self._merge_buf.this_share,
+                self._pack_buf,
+            )
+            rt_inst.recv_vector(
                 self._merge_buf.nxt_share,
-            ):
-                rt_inst.recv_vector(
-                    share,
-                    self._pack_buf,
-                )
+                self._pack_buf,
+            )
         else:
             if self._server_role is ServerRole.PEER0:
                 ch_prev = ch_set_holder
@@ -326,7 +289,6 @@ class AgentServer:
                 ell=1,
                 party=int(self._server_role),
             )(ch_prev, ch_nxt)
-
             rep3_inst.recv_vector_share(
                 self._merge_buf,
                 self._pack_buf,
@@ -336,9 +298,8 @@ class AgentServer:
             new_token = self._tc.insert(
                 node=self._merge_buf
             )
-            # A successful JOIN must leave root_node consistent with the
-            # inserted leaf before the Agent reports DONE.
-            self._tc.execute_merge()
+            # The new leaf is marked dirty; the tree merge is deferred to
+            # an explicit Manager SYNC (see sync_cache).
             return new_token
 
         if prot_type is ProtType.UPDATE:
@@ -346,8 +307,7 @@ class AgentServer:
                 token=token,
                 new_node=self._merge_buf,
             )
-            # Same rule for UPDATE.
-            self._tc.execute_merge()
+            # The updated leaf is marked dirty; merge deferred to explicit SYNC.
             return None
 
         raise ValueError(
@@ -355,10 +315,9 @@ class AgentServer:
         )
 
     def sync_cache(self) -> None:
-        """Explicit cache synchronisation retained for compatibility.
-
-        ``response_share_bf`` already synchronises JOIN/UPDATE/QUIT before
-        returning, so normal callers should not need to call this again.
+        """Explicitly merge the TreeCache (three-party, lockstep on all
+        three Agents).  JOIN/UPDATE/QUIT only mark the cache dirty; the
+        actual tree merge is deferred until the Manager issues a SYNC.
         """
         self._tc.execute_merge()
 
@@ -374,7 +333,7 @@ class AgentServer:
             if self._server_role == ServerRole.STEWARD:
                 _rt_inst_for_idx_prev.send_scalar(val)
                 ss.nxt_share = _rt_inst_for_idx_nxt.recv_scalar()
-                
+
             elif self._server_role == ServerRole.PEER0:
                 _rt_inst_for_idx_prev.send_scalar(val)
                 ss.nxt_share = _rt_inst_for_idx_nxt.recv_scalar()
@@ -400,11 +359,10 @@ class AgentServer:
             for ishare in idx_shares:
                 idx_rep_share = _reshare_idx_share(val=ishare)
                 alpha = mpmt.ring_add(
-                            ell=self._ell_add2, 
-                            a=idx_rep_share.this_share, 
+                            ell=self._ell_add2,
+                            a=idx_rep_share.this_share,
                             b=idx_rep_share.nxt_share
                         )
-                
                 alpha_set.append(alpha)
 
             keylist_e0 = []
@@ -422,8 +380,8 @@ class AgentServer:
             self._rep3_inst_ell_root.crng_vec(self._query_buf.nxt_share)
 
             self._rep3_inst_ell_root.reshare_vector(
-                vec=self._query_buf.nxt_share, 
-                sv=self._query_buf, 
+                vec=self._query_buf.nxt_share,
+                sv=self._query_buf,
                 aux_buf=pack_buf
             )
 
@@ -433,8 +391,8 @@ class AgentServer:
             )
 
             dr_share = mpmt.ring_add(
-                ell=self._ell_root, 
-                a=dr_rep_share.this_share, 
+                ell=self._ell_root,
+                a=dr_rep_share.this_share,
                 b=dr_rep_share.nxt_share
             )
 
@@ -458,7 +416,7 @@ class AgentServer:
                     idx_shares.append(rt_inst.recv_scalar())
 
             bias_set = []
-            for ishare in idx_shares:  
+            for ishare in idx_shares:
                 idx_rep_share = _reshare_idx_share(val=ishare)
                 if self._server_role == ServerRole.PEER0:
                     bias_set.append(idx_rep_share.nxt_share)
@@ -473,24 +431,24 @@ class AgentServer:
                 eval_bg = mpmt.ring_sub(ell=self._ell_add2, a=0, b=bias)
                 eval_ed = mpmt.ring_add(ell=self._ell_add2, a=eval_bg, b=self._bf_size)
                 eval_ed = mpmt.ring_sub(ell=self._ell_add2, a=eval_ed, b=1)
-                
+
                 self._server_dpf_inst.eval_range(
-                    keyjson=key, 
-                    buf=self._query_buf.this_share, 
-                    bg=eval_bg, 
-                    ed=eval_ed, 
+                    key_json=key,
+                    buf=self._query_buf.this_share,
+                    bg=eval_bg,
+                    ed=eval_ed,
                     cores=self._cores
                 )
 
                 mpmt.Rvector(ell=self._ell_root).add(
-                    a=self._query_buf.nxt_share, 
-                    b=self._query_buf.this_share, 
+                    a=self._query_buf.nxt_share,
+                    b=self._query_buf.this_share,
                     out=self._query_buf.nxt_share
                 )
 
             self._rep3_inst_ell_root.reshare_vector(
-                vec=self._query_buf.nxt_share, 
-                sv=self._query_buf, 
+                vec=self._query_buf.nxt_share,
+                sv=self._query_buf,
                 aux_buf=pack_buf
             )
 
