@@ -1,268 +1,242 @@
-# MPMT — Multiparty Private Membership Test
+# MPMT — Multi-party Private Membership Test
 
-[![status](https://img.shields.io/badge/status-WIP-orange)]()
+![status](https://img.shields.io/badge/status-finalizing-blue)
+![type](https://img.shields.io/badge/type-research%20prototype-lightgrey)
 
-A research prototype for **private set membership testing** under the semi-honest
-model. Set holders contribute private sets, queriers test whether an element
-belongs to the aggregated set — and **nobody learns the other party's data**:
-holders never see the queried elements, queriers never see the sets.
+This repository is a research prototype for the **Multi-party Private Membership Test (MPMT)** problem under the semi-honest security model: multiple set holders each contribute a private set, and a querier can test whether an element belongs to the union of those sets. MPMT aims to answer membership queries while:
 
-The project is built in **two layers**:
+1. not revealing the holders' private sets to the querier;
+2. not revealing the element being queried to the set holders.
 
-1. **`mpmt`** — a self-contained **Python package** (C++20 core + nanobind
-   bindings) that implements the underlying MPC protocols and can be used
-   independently as a low-level multiparty-computation toolbox.
-2. **The application layer** — a complete membership service (three MPC
-   Agents + a Manager control panel + CLI clients) built **on top of** `mpmt`.
+The project provides two parts:
 
-## Table of Contents
-
-- [Introduction](#introduction)
-- [Architecture](#architecture)
-- [Using `mpmt` (Protocol Tutorials)](#using-mpmt-protocol-tutorials)
-- [Using the Application](#using-the-application)
-- [Running the Tests](#running-the-tests)
-- [Disclaimer](#disclaimer)
-- [References](#references)
-
----
-
-## Introduction
-
-MPMT answers the question: **“is this element in the union of the holders'
-sets?”** without any party revealing its private input.
+1. the multi-party computation building blocks and the protocol family MPMT needs, packaged as a standalone Python package **`mpmt`**, with detailed usage documentation in [`tutorial/`](./tutorial/);
+2. a **single-machine simulation application** for the **Compromise Credential Checking (C3)** scenario (see the figure below), built on the `mpmt` Python interface. Under the non-collusion assumption of the three proxy servers (Agent Server: Steward, Peer0 & Peer1) and the semi-honest security model, the compromised credential databases (i.e. the Set Holder role in MPMT) contribute the shares of their own sets without revealing their data; a querier (i.e. the Querier role in MPMT) tests whether a private credential that must not be disclosed appears in those databases. The proxy servers securely aggregate the set shares of the compromised credential databases and provide the query capability on the querier's behalf.
 
 ![C3 scenario overview](./c3_scenario.png)
 
-```
-set holders                         queriers
-  │ private sets                      │ private element
-  ▼                                   ▼
-┌──────────────────────────────────────────────────┐
-│       multi-party private membership test        │
-│    Bloom filter · secret sharing · DPF · SIMD    │
-└──────────────────────────────────────────────────┘
-  ▲                                   ▲
-nothing about the set leaks     nothing about the query leaks
-```
-
-Each holder encodes its set as a Bloom filter and **secret-shares** it among
-three non-colluding MPC Agents. A querier runs a **distributed point function
-(DPF)** so that only the three Agents jointly learn a single membership bit —
-even the Agents individually learn nothing.
-
-The protocols are implemented once, in C++, wrapped as the standalone
-`mpmt` Python package, and reused by the application layer.
-
----
-
-## Architecture
-
-The project is built in **two layers**: the `mpmt` protocol package (a
-standalone C++20 + nanobind Python library) and, on top of it, a complete
-private membership service.
+## Project structure
 
 ```
   ┌─ Application layer ─────────────────────────────────────────────┐
-  │                                                                 │
   │  manage_server                                                  │
   │  agent_server ×3 — STEWARD / PEER0 / PEER1                      │
   │  set_holder · querier                                           │
-  │                                                                 │
   ├──MPMT protocol package ─────────────────────────────────────────┤
-  │                                                                 │
   │  Python API: AgentServer · SetHolder · Querier · _TreeCache     │
   │  Channel · Rvector · ShrRep3 · ShrAdd2 · Dpf · RingTransport    │
-  │                                                                 │
   ├─ C++ bindings ──────────────────────────────────────────────────┤
-  │                                                                 │
-  │  nanobind · shared_ptr IOChannel registry · GIL-safe I/O        │
-  │                                                                 │
+  │  nanobind · shared_ptr · IOChannel                              │
   ├─ C++ core ──────────────────────────────────────────────────────┤
-  │                                                                 │
-  │  Rvector     SIMD-packed ring arithmetic  (1..8)                │
-  │  ABY3        3-party replicated RSS       (1..8)                │
-  │  EMP2        2-party additive sharing    (2..31)                │
-  │  BGI16       distributed point function (13..31)                │
-  │  RingTransport · Utils                                          │
-  │                                                                 │
+  │  ABY3        3-party replicated RSS                             │
+  │  EMP2        2-party additive sharing                           │
+  │  BGI16       distributed point function                         │
+  │  Utils (Rvector, RingTransport, etc.)                           │
   └─────────────────────────────────────────────────────────────────┘
 ```
 
-### The `mpmt` protocol package
+The diagram above shows the overall architecture. The lower three layers are bundled in the `mpmt` package, which contains the reusable MPMT protocol implementations and can be used independently of this project's application layer. It exposes MPC building blocks and the high-level protocol objects the application uses through a Python interface; the low level is a C++20 core bound to Python with nanobind.
 
-`mpmt` is the cryptographic core — an **independently usable Python package**
-(`import mpmt`) that wraps the C++20 implementations with
-[nanobind](https://nanobind.readthedocs.io/), exposing share vectors, channels,
-and protocol objects directly to Python.
+Basic examples and protocol-level usage are in [`tutorial/`](./tutorial/):
+- [`tutorial/README.md`](./tutorial/README.md) — Python interface overview;
+- [`tutorial/base/`](./tutorial/base/) — basic data structures and ring operations;
+- [`tutorial/building_blocks/`](./tutorial/building_blocks/) — MPC building blocks;
+- [`tutorial/net/`](./tutorial/net/) — communication Channels and network transport.
 
-- **SIMD-packed ring arithmetic** — `Rvector` packs many small ring elements
-  into machine words; batch `add / mul / hadamard` run at near-native speed.
-- **Replicated secret sharing (ABY3)** — shares are held as `(thisShare,
-  nxtShare)` pairs; protocols run over three pairwise `Channel`s.
-- **Distributed point function (BGI16)** — a querier sends two *function
-  shares*; the Agents evaluate them over the shared Bloom filter and reveal a
-  single membership bit.
-- **IOChannel lifetime** — Python `Channel` objects hold opaque handles into a
-  `shared_ptr` registry, guaranteeing every C++ protocol object outlives its
-  channels.
-
-> The **two-party** secure computation builds
-> directly on [**EMP-toolkit**](https://github.com/emp-toolkit), wrapped here in a
-> thin layer.
-
-### Application layer
-
-The application turns `mpmt` into a runnable **private membership test service**. It
-adds orchestration, persistence, and human-facing interfaces on top of the raw
-protocols — while keeping the MPC itself entirely inside `mpmt`.
+The application layer is built entirely on top of `mpmt`. It provides a directly runnable local simulation environment, using the C3 scenario as an example, to simulate a complete MPMT system. The system contains:
 
 | Component | Role |
-|-----------|------|
-| `pretreat` | One-time setup: allocates set-holder / querier user IDs, splits synthetic datasets, writes protocol parameters (`pre.json`). |
-| `agent_server` (×3) | The MPC parties (`steward`, `peer0`, `peer1`). Each holds a secret-shared **TreeCache** — a binary OR-tree of Bloom-filter shares — persisted to disk. |
-| `manage_server` | The orchestrator: interactive control panel, HTTP reserve/execute API, a **global FIFO queue** with a **single-active** scheduler, and an explicit `ms sync` that triggers the tree merge. |
-| `set_holder` CLI | A holder joins the shared structure (`JOIN`), replaces its set (`UPDATE`), or leaves (`QUIT`). |
-| `querier` CLI | Queries an element and prints `1` (member) or `0` (not member). |
+|---|---|
+| `pretreat` | generates the datasets, protocol parameters and a clean storage environment for a fresh run |
+| `steward` / `peer0` / `peer1` | the Agent Server |
+| `manage_server` | coordinates application operations, task scheduling, Agent connections and explicit TreeCache sync |
+| `set_holder` | executes set-holder operations: `JOIN`, `UPDATE` and `QUIT` |
+| `querier` | executes membership queries |
 
-**Key semantics**
+All processes of this example application can run on a single machine, but the structure and configuration remain logically independent.
 
-- **JOIN / UPDATE / QUIT never merge automatically.** Each operation only
-  marks the TreeCache *dirty*. The tree is merged — and the new root published —
-  only when the operator issues `ms sync` in the Manager. This batches many
-  writes into one MPC merge.
-- **One operation at a time.** The Manager serializes all work through a FIFO
-  queue (single active operation); `ms sync` is inserted immediately after the
-  current operation and ahead of every queued business operation.
-- **Restart-safe.** TreeCache state and the manager DB are persisted, so the
-  service can be stopped and restarted without `pretreat` (see the tests).
+## Example application in the C3 scenario
+### Business flow
 
-> **Protocol usage** — see [Using `mpmt` (Protocol Tutorials)](#using-mpmt-protocol-tutorials)
-> for hands-on examples, or the [tutorial/](./tutorial/) directory directly.
+A fresh application run starts with preprocessing — `pretreat` — which generates the users, datasets, storage directories and protocol parameters needed by the local simulation.
 
----
+Then the three MPC Agents are started: `STEWARD`, `PEER0`, `PEER1`. Each Agent maintains its own local protocol state and TreeCache shares. Manage Server connects to the three Agents and provides an HTTP interface plus an application-layer scheduler. Manage Server receives business requests through the HTTP interface (merging database requests, updating sets, and querier requests to query a private element), and its application-layer scheduler then dispatches the three proxy servers to establish TCP connections with the databases (set holders) / queriers and run the protocols.
 
-## Using `mpmt` (Protocol Tutorials)
+Set holders can modify the shared membership structure through the following operations:
 
-The `mpmt` package is self-contained: build once, then `import mpmt` from any
-Python environment. For the full protocol-level documentation and examples,
-head to the [tutorial](./tutorial/) directory:
+```text
+JOIN
+UPDATE
+QUIT
+```
 
-| Directory | Topics |
-|-----------|--------|
-| [base/](./tutorial/base/) | ring operations, rvector, share vectors |
-| [building_blocks/](./tutorial/building_blocks/) | rep3 (ABY3), add2 (EMP2), dpf |
-| [net/](./tutorial/net/) | channels, ring transport |
+JOIN adds a new compromised credential database to the service; UPDATE lets a database already in the service refresh its own set; QUIT lets a database leave the service. These operations update the TreeCache state but **do not update the aggregate shares** — aggregation must be explicitly triggered by Manage Server's `SYNC` sync task. When Manage Server runs `ms sync` (see [Manage Server commands](#8-supplementary-manage-server-commands) below for the full command reference), the `SYNC` task has the highest priority: it is scheduled **after the currently running operation and before any other queued business operation**. After the sync completes, a querier can run `QUERY` and obtain the membership result:
 
-> Protocol tutorials for `handler / query / set holder / tree cache` and the
-> Flask demo are planned; the protocol objects themselves are already exposed
-> in the package (see `mpmt.AgentServer`, `mpmt.SetHolder`, `mpmt.Querier`).
+```text
+1  -> belongs to the set
+0  -> does not belong to the set
+```
 
----
+The application persists both the Manage Server state and the Agent Server state. Therefore, restarting the application after a normal shutdown does not require re-running `pretreat`; `pretreat` only initializes a task (building the sets, creating the storage directories, etc.) so that every experiment starts from a clean environment.
 
-## Using the Application
+When the last set holder quits, the next `ms sync` aggregates the empty-set state and deletes the previously aggregated TreeCache root.
 
-### 1. Build
+### Running the application
+
+#### 1. Build and install `mpmt`
+
+`mpmt` is a C++20 extension (bound with nanobind); building it needs a C++
+toolchain and emp-toolkit in addition to `pip`.
+
+Prerequisites (Ubuntu 22.04):
+
+```bash
+# system toolchain + crypto / JSON libraries
+sudo apt-get install -y clang-15 cmake ninja-build \
+    libsodium-dev nlohmann-json3-dev libssl-dev python3-pip
+
+# emp-toolkit (emp-tool, emp-ot, emp-sh2pc) built from source
+.github/install-deps.sh emp-tool
+.github/install-deps.sh emp-ot
+.github/install-deps.sh emp-sh2pc
+```
+
+Then build and install the package:
 
 ```bash
 pip install -e . -v
 ```
 
-### 2. Fresh preprocessing
+> The GitHub Actions workflow (`.github/workflows/ci.yml`) performs exactly
+> these steps — see it for the current dependency list.
+
+#### 2. Clean the task environment
 
 ```bash
 cd application
-python3 run.py pretreat -f          # generate users, datasets, params
+python3 run.py pretreat -f
 ```
 
-### 3. Start the three MPC Agents
+This command generates the users, datasets, protocol parameters and a fresh local storage state the application needs.
+
+#### 3. Start the three MPC Agents
+
+Run these in three separate terminals:
 
 ```bash
-python3 run.py steward &             # three terminals (or background)
-python3 run.py peer0  &
-python3 run.py peer1  &
+python3 run.py steward
 ```
 
-Each Agent prints `management listening on ...` when ready.
+```bash
+python3 run.py peer0
+```
 
-### 4. Start the Manager
+```bash
+python3 run.py peer1
+```
+
+#### 4. Start Manage Server
+
+Open another terminal and run:
 
 ```bash
 python3 run.py manage_server
 ```
 
-You land in the control panel:
+Manage Server enters an interactive console:
 
+```text
+c3-manager>
 ```
+
+Start the backend service and connect to the three Agents:
+
+```text
 c3-manager> ms start
 ```
 
-`ms start` connects to the three Agents and starts the HTTP API (idempotent —
-a second `ms start` reports `already started`).
+Running `ms start` again does not start a second scheduler or a second HTTP service.
 
-### 5. Set holders contribute / update / leave
+#### 5. Run set-holder operations
+
+User IDs are generated automatically by `pretreat`.
+
+Add a set holder:
 
 ```bash
-# JOIN the shared structure (user IDs come from pretreat/set_holder_users.json)
 python3 run.py set_holder -e JOIN <user_id>
-
-# replace the set (UPDATE) or leave (QUIT)
-python3 run.py set_holder -e UPDATE <user_id>
-python3 run.py set_holder -e QUIT  <user_id>
 ```
 
-### 6. Queriers test membership
+Replace the holder's current set:
 
 ```bash
-# QUERY an element (user ID comes from pretreat/querier_users.json)
+python3 run.py set_holder -e UPDATE <user_id>
+```
+
+Remove the holder:
+
+```bash
+python3 run.py set_holder -e QUIT <user_id>
+```
+
+`JOIN`, `UPDATE` and `QUIT` never automatically aggregate a new TreeCache root.
+
+#### 6. Aggregate pending changes
+
+In the Manage Server console:
+
+```bash
+ms sync
+```
+
+After a set holder changes its set, run `ms sync` if you want those changes to enter the queryable aggregated state.
+
+#### 7. Run a membership query
+
+```bash
 python3 run.py querier -e QUERY <user_id> <element>
 ```
 
-Prints `"result": 1` if the element is in the aggregated set, `"result": 0`
-otherwise.
+The query result contains the membership bit for the element.
 
-### 7. Publish the merged tree
+#### 8. Supplementary: Manage Server commands
 
-JOIN / UPDATE / QUIT only mark the tree dirty. To merge all pending changes
-and publish the new root:
+The interactive Manage Server is the main control entry of the local application.
 
+| Command | Description |
+|---|---|
+| `ms start` | connect to the three Agents and start the Manage Server backend |
+| `ms status` | show the Manage Server state and each Agent's connection state |
+| `ms sync` | sync the TreeCache and aggregate the current state |
+| `ms log` | show recent Manage Server logs |
+| `ms exit` | stop the Manage Server |
+| `help` | list the available commands |
+
+## Tests
+
+The test suite lives in [`tests/`](./tests/) and is organised into three layers by **system under test**:
+
+| Layer | Directory | System under test |
+|---|---|---|
+| mpmt building blocks | `tests/mpmt_components/` | Rvector / Channel / RingTransport / util / ABY3 / EMP2 / DPF / ring_conv / reveal-flush / hash / 3-party TCP |
+| mpmt high-level protocols | `tests/mpmt_protocols/` | SetHolder / Querier / AgentServer / TreeCache (incl. last-leaf no-tree) / BF aggregation |
+| application | `tests/app/` | Manage Server state machine / FIFO / single-active scheduling / explicit `ms sync` / restart persistence |
+
+**Full usage and details are in [`tests/README.md`](./tests/README.md)** (old→new mapping, per-layer system under test, Stack lifecycle, coverage comparison).
+
+```bash
+# everything (all three layers in order; judged purely by subprocess return code)
+python3 tests/run_all.py
+
+# per layer
+python3 tests/run_components.py [--small]
+python3 tests/run_protocols.py
+python3 tests/run_app.py
 ```
-c3-manager> ms sync
-```
 
-### Manager control panel
+`mpmt` is an installable Python package (`pip install -e .`); use the `python3` of any environment that has it installed.
 
-| Command | Action |
-|---------|--------|
-| `ms start` | Connect Agents + start HTTP + scheduler (idempotent) |
-| `ms status` | Show backend state and Agent connections (● connected / ● not) |
-| `ms sync` | Merge the TreeCache (runs after the current op, ahead of the queue) |
-| `ms log` | Show recent log lines |
-| `ms exit` | Stop the manager |
-| `help` | List commands |
-
-Up / Down arrow recall command history.
-
-### Example end-to-end session
-
-```
-# terminal 1–3: Agents          terminal 4: Manager      terminal 5: clients
-python3 run.py steward          python3 run.py manage_server
-python3 run.py peer0            c3-manager> ms start
-python3 run.py peer1
-                                                        python3 run.py set_holder -e JOIN <holder_id>
-                                                        python3 run.py querier -e QUERY <querier_id> <element>
-c3-manager> ms sync
-```
-
----
-
-## Running the Tests
-
-> **Reserved** — the test-suite walkthrough (low-level protocol tests and the
-> application-layer E2E scenarios) will be documented here.
-
----
+Application-layer tests **automatically start the services they need** (fresh pretreat + the three Agents + Manage Server `ms start`, plus automatic `ms sync` / automatic restart where needed) — no manual terminals required.
 
 ## Disclaimer
 
