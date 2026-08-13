@@ -82,7 +82,7 @@ namespace scucse::crypto::bind
     constexpr uint64_t RVECTOR_ELL_MIN  = 1,                RVECTOR_ELL_MAX = 8;    //  Rvector
     constexpr uint64_t DPF_ELL_IN_MIN   = 13,               DPF_ELL_IN_MAX  = 31;   //  DPF  in
     constexpr uint64_t DPF_ELL_OUT_MIN  = 2,                DPF_ELL_OUT_MAX = 6;    //  DPF  out
-    constexpr uint64_t RSS3_ELL_MIN     = 1,                RSS3_ELL_MAX    = 6;    //  ABY3 (3-party RSS)
+    constexpr uint64_t RSS3_ELL_MIN     = 1,                RSS3_ELL_MAX    = 8;    //  ABY3 (3-party RSS)
     constexpr uint64_t ADD2_ELL_MIN     = 2,                ADD2_ELL_MAX    = 31;   //  EMP2 (2-party additive)
 
     // ———  NetIO shared_ptr registry  ———

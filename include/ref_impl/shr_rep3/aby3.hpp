@@ -638,9 +638,7 @@ public:
             RVECTOR<ELL_TO>::add(prod01, tmp, prod01);
         }
         {
-            nioToPrev_->send_data(prod01.data(), prod01.bytesSize());
-            nioToPrev_->flush();
-            nioToNext_->recv_data(tmp.data(), tmp.bytesSize());
+            _reshare_ring(prod01.data(), tmp.data(), prod01.bytesSize());
         }
 
         RVECTOR<ELL_TO>::add(prod01, prod01, prod01);
@@ -691,9 +689,7 @@ public:
             RVECTOR<ELL_TO>::add(prod01, tmp, prod01);
         }
         {
-            nioToPrev_->send_data(prod01.data(), prod01.bytesSize());
-            nioToPrev_->flush();
-            nioToNext_->recv_data(tmp.data(), tmp.bytesSize());
+            _reshare_ring(prod01.data(), tmp.data(), prod01.bytesSize());
         }
 
         RVECTOR<ELL_TO>::add(prod01, prod01, prod01);

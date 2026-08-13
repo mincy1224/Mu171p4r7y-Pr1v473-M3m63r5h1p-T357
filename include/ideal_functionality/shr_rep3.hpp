@@ -29,10 +29,12 @@ namespace scucse::crypto
     //  Public share types
 
     /// @brief Scalar replicated share: (thisShare, nxtShare).
+    /// @note Fields are 32-bit so a single share can hold any ELL in [1,31].
+    ///       The ELL=1 scalar protocol still only transmits the low byte.
     struct ShrRep3ShareScalar
     {
-        uint8_t thisShare{0};
-        uint8_t nxtShare{0};
+        uint32_t thisShare{0};
+        uint32_t nxtShare{0};
     };
 
     /// @brief Vector replicated share over Z_{2^ELL}.
