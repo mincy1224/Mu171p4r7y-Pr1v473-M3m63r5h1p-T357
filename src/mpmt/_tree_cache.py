@@ -665,6 +665,14 @@ class _TreeCache:
         self._mark_corrupted()
 
         if self.leaf_num == 0:
+            # Last holder left: publish an explicit no-tree state.  QUERY
+            # reads root_node directly from memory, so zero-fill it in place
+            # (not just delete the files) — a stale root would otherwise keep
+            # answering "member" for every former holder.
+            self.root_node.this_share.fill()
+            self.root_node.nxt_share.fill()
+            self.root_this_path.unlink(missing_ok=True)
+            self.root_nxt_path.unlink(missing_ok=True)
             self._dirty_leaf.clear()
             self._mark_valid()
             return
