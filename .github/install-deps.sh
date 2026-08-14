@@ -11,7 +11,6 @@ echo "Building $PKG into $PREFIX ..."
 git clone --depth 1 "$REPO" "/tmp/$PKG"
 cd "/tmp/$PKG"
 
-# emp-tool HEAD is missing <array> in bit.h (breaks GCC 12+ on GitHub runner)
 find . -name 'bit.h' -exec sed -i '1i#include <array>' {} \; || true
 
 cmake -B build \
@@ -22,10 +21,6 @@ cmake -B build \
   -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 
 cmake --build build -j"$(nproc)"
-# Only elevate when the prefix needs root (e.g. /usr/local).  The GitHub
-# Actions cache must be able to restore this prefix as the unprivileged
-# runner, so CI installs to $HOME/.local (user-writable, and already on
-# CMakeLists.txt's CMAKE_PREFIX_PATH).
 mkdir -p "$PREFIX" || true
 if [[ -w "$PREFIX" ]]; then
     cmake --install build

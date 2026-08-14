@@ -4,7 +4,7 @@ on:
   push:
   pull_request:
   schedule:
-    - cron: '7 3 * * 1'   # every Monday 03:07 UTC
+    - cron: '7 3 * * 1'
   workflow_dispatch:
 
 jobs:
@@ -27,13 +27,6 @@ jobs:
             libsodium-dev nlohmann-json3-dev \
             libssl-dev python3-pip
 
-      # -- emp-toolkit ------------------------------------------
-      # Installed into a *user-writable* prefix ($HOME/.local) so the cache can
-      # restore it as the unprivileged runner.  The old /usr/local path failed
-      # cache restore with `tar: ... Cannot open: Permission denied`, forcing a
-      # full ~27 min rebuild of emp-tool/emp-ot/emp-sh2pc on every run.
-      # CMakeLists.txt already appends $HOME/.local to CMAKE_PREFIX_PATH, so
-      # the mpmt build finds emp here with no extra configuration.
       - name: Cache emp-toolkit
         id: cache-emp
         uses: actions/cache@v4
@@ -44,8 +37,6 @@ jobs:
           key: emp-${{ hashFiles('.github/install-deps.sh') }}
 
       - name: Build emp-toolkit
-        # Guard on the installed cmake config (not just cache-hit) so a partial
-        # or poisoned cache heals itself instead of skipping the build.
         run: |
           if [ ! -f "$HOME/.local/lib/cmake/emp-sh2pc/emp-sh2pc-config.cmake" ]; then
             export EMP_INSTALL_PREFIX="$HOME/.local"
@@ -56,10 +47,6 @@ jobs:
             echo "emp-toolkit restored from cache; skipping build"
           fi
 
-      # -- Python env -------------------------------------------
-      # Cache pip's HTTP download cache so the runtime deps from pyproject
-      # (cloudpickle, flask, numpy) and the build tools (nanobind,
-      # scikit-build-core) are fetched without re-downloading on reruns.
       - name: Cache pip downloads
         uses: actions/cache@v4
         with:
@@ -69,12 +56,6 @@ jobs:
       - name: Upgrade pip
         run: pip install --upgrade pip
 
-      # -- mpmt wheel (the C++ build, cached) -------------------
-      # `pip install -e .` recompiles the entire extension on every run: the
-      # isolated build env gives nanobind a different path each time, so ninja
-      # never reuses object files.  Build a wheel once and cache it; on cache
-      # hit the install below just unpacks the wheel (no C++ compile; a cold
-      # build is ~5 min locally).
       - name: Cache mpmt wheel
         uses: actions/cache@v4
         with:
@@ -93,13 +74,6 @@ jobs:
       - name: Install mpmt
         run: pip install "$HOME"/mpmt-wheelhouse/mpmt-*.whl
 
-      # -- Tests ------------------------------------------------
-      # CI runs a SMALL-scale verification only.  The full three-layer suite
-      # (incl. the QUERY-round protocol tests and the heavy app E2Es) is run
-      # locally on every commit (mpmt_venv, tests/run_all.py).  The set below
-      # is exactly the tests proven green on the 2-core GitHub runner:
-      # test_query.py's QUERY round hangs there (a timing issue in the 3-party
-      # query MPC, unreproducible locally), so it is deliberately left out.
       - name: Run tests (small-scale)
         run: |
           python3 tests/run_components.py --small --stress-mode quick
