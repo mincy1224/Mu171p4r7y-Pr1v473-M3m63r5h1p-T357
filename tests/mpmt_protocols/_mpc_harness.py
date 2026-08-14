@@ -17,6 +17,7 @@ instead of discarding them — that was the bug in an earlier design.
 from __future__ import annotations
 
 import multiprocessing as mp
+import queue
 import secrets
 import socket
 import tempfile
@@ -119,22 +120,31 @@ class _Router:
         self.q = q
         self.stash: list[tuple] = []
 
-    def _read(self, timeout):
-        if self.stash:
-            return self.stash.pop(0)
-        return self.q.get(timeout=timeout)
-
     def wait(self, rnd, kind, count=3, timeout=30.0):
-        got = []
+        """Collect *count* messages of (rnd, kind).
+
+        Stashed messages for a different (round, kind) must not block the queue
+        read: the old implementation popped them from the stash, re-added them,
+        and spun forever, so this round's own messages sitting behind them in
+        the queue were never read (CI-only 'only 1/3 done').  We first take any
+        matching messages already in the stash, then drain the queue.
+        """
+        got, keep = [], []
+        for m in self.stash:
+            (got if m[0] == rnd and m[1] == kind else keep).append(m)
+        self.stash = keep
         deadline = time.monotonic() + timeout
         while len(got) < count and time.monotonic() < deadline:
-            m = self._read(5)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                m = self.q.get(timeout=remaining)
+            except queue.Empty:
+                break
             if m[1] == "err":
                 raise RuntimeError(f"agent error: {m}")
-            if m[0] != rnd:
-                self.stash.append(m)
-                continue
-            if m[1] == kind:
+            if m[0] == rnd and m[1] == kind:
                 got.append(m)
             else:
                 self.stash.append(m)
