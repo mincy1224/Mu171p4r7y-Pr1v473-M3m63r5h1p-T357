@@ -66,14 +66,32 @@ jobs:
           path: ~/.cache/pip
           key: pip-${{ hashFiles('pyproject.toml') }}
 
-      - name: Install Python packages
-        run: |
-          pip install --upgrade pip
-          pip install 'nanobind>=2.13' scikit-build-core
+      - name: Upgrade pip
+        run: pip install --upgrade pip
 
-      # -- Build mpmt -------------------------------------------
-      - name: Build mpmt
-        run: pip install -e . -v
+      # -- mpmt wheel (the C++ build, cached) -------------------
+      # `pip install -e .` recompiles the entire extension on every run: the
+      # isolated build env gives nanobind a different path each time, so ninja
+      # never reuses object files.  Build a wheel once and cache it; on cache
+      # hit the install below just unpacks the wheel (no C++ compile; a cold
+      # build is ~5 min locally).
+      - name: Cache mpmt wheel
+        uses: actions/cache@v4
+        with:
+          path: ~/mpmt-wheelhouse
+          key: mpmt-${{ hashFiles('.github/install-deps.sh', 'pyproject.toml', 'CMakeLists.txt', 'src/**', 'include/**') }}
+
+      - name: Build mpmt wheel (if not cached)
+        run: |
+          if ls "$HOME"/mpmt-wheelhouse/mpmt-*.whl >/dev/null 2>&1; then
+            echo "mpmt wheel restored from cache; skipping build"
+          else
+            mkdir -p "$HOME/mpmt-wheelhouse"
+            pip wheel . -w "$HOME/mpmt-wheelhouse" --no-deps
+          fi
+
+      - name: Install mpmt
+        run: pip install "$HOME"/mpmt-wheelhouse/mpmt-*.whl
 
       # -- Tests ------------------------------------------------
       - name: Run all tests
