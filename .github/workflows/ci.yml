@@ -95,10 +95,4 @@ jobs:
 
       # -- Tests ------------------------------------------------
       - name: Run all tests
-        run: |
-          python3 tests/run_components.py || exit 1
-          # The protocols layer has a rare CI-only harness race (agents report
-          # '1/3 done'); it never reproduces locally (incl. under CPU load)
-          # and passes cleanly on retry.  Retry once before declaring failure.
-          python3 tests/run_protocols.py || python3 tests/run_protocols.py || exit 1
-          python3 tests/run_app.py || exit 1
+        run: python3 tests/run_all.py
